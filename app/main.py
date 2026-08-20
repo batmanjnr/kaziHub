@@ -5,6 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi.middleware.cors import CORSMiddleware
 from beanie import init_beanie
 import dns.resolver
+from app.models.pending_user import PendingUser
 
 # Monkey-patch for Beanie/Motor compatibility
 AsyncIOMotorClient.append_metadata = lambda self, *args, **kwargs: None
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI):
             Profile,
             Gig,
             Verification,
+            PendingUser,
         ]
     )
     yield

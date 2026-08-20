@@ -1,4 +1,3 @@
-# app/models/user.py
 from datetime import datetime
 from typing import Optional
 from beanie import Document, Indexed
@@ -18,6 +17,8 @@ class User(Document):
     is_email_verified: bool = False
     otp_code: Optional[str] = None
     otp_expires_at: Optional[datetime] = None
+    reset_otp_code: Optional[str] = None
+    reset_otp_expires_at: Optional[datetime] = None
     created_at: datetime = datetime.utcnow()
 
     class Settings:

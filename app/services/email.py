@@ -1,41 +1,56 @@
+import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from fastapi import HTTPException, status
+
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
 
-def send_otp_email(email_to: str, otp: str):
-    """Send 5-digit OTP code to user via Mailtrap SMTP."""
-    message = MIMEMultipart("alternative")
-    message["Subject"] = "KaziHub - Verify Your Email"
-    message["From"] = settings.EMAILS_FROM_EMAIL
-    message["To"] = email_to
 
-    text_content = f"Welcome to KaziHub. Your 5-digit verification code is: {otp}. This code expires in 10 minutes."
-
-    html_content = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
-        <h2 style="color: #1a365d; text-align: center;">Welcome to KaziHub</h2>
-        <p>Thank you for registering. Please use the following 5-digit verification code to complete your signup process:</p>
-        <div style="text-align: center; margin: 30px 0;">
-            <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #2b6cb0; background: #ebf8ff; padding: 10px 20px; border-radius: 6px;">{otp}</span>
-        </div>
-        <p style="color: #718096; font-size: 14px;">This code will expire in 10 minutes. If you did not request this, please ignore this email.</p>
-    </div>
-    """
-
-    message.attach(MIMEText(text_content, "plain"))
-    message.attach(MIMEText(html_content, "html"))
-
+def send_otp_email(to_email: str, otp: str) -> None:
+    """Send OTP email in background task."""
     try:
-        with smtplib.SMTP(settings.SMTP_HOST, int(settings.SMTP_PORT), timeout=10) as server:
+        msg = MIMEMultipart()
+        msg["From"] = settings.EMAILS_FROM_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = "Verify Your Email - KaziHub"
+
+        body = f"Your 5-digit verification code is: {otp}\n\nThis code expires in 10 minutes."
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
             server.starttls()
             server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-            server.sendmail(settings.EMAILS_FROM_EMAIL, email_to, message.as_string())
+            server.sendmail(settings.EMAILS_FROM_EMAIL, to_email, msg.as_string())
+
+        logger.info(f"Successfully sent OTP email to {to_email}")
+
     except Exception as e:
-        print(f"Failed to send email to {email_to}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to send verification email: {str(e)}"
+        logger.error(f"Failed to send OTP email to {to_email}: {e}")
+
+
+def send_password_reset_email(to_email: str, otp: str) -> None:
+    """Send password reset OTP email via background task."""
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = settings.EMAILS_FROM_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = "Password Reset Request - KaziHub"
+
+        body = (
+            f"You requested a password reset for your account.\n\n"
+            f"Your 5-digit reset code is: {otp}\n\n"
+            f"This code will expire in 10 minutes. If you did not request this, please ignore this email."
         )
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+            server.starttls()
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.sendmail(settings.EMAILS_FROM_EMAIL, to_email, msg.as_string())
+
+        logger.info(f"Successfully sent password reset email to {to_email}")
+
+    except Exception as e:
+        logger.error(f"Failed to send password reset email to {to_email}: {e}")
