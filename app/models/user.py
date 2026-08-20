@@ -15,6 +15,9 @@ class User(Document):
     role: str  # "client" or "artisan"
     hashed_password: str
     is_active: bool = True
+    is_email_verified: bool = False
+    otp_code: Optional[str] = None
+    otp_expires_at: Optional[datetime] = None
     created_at: datetime = datetime.utcnow()
 
     class Settings:
@@ -29,12 +32,7 @@ class UserCreate(BaseModel):
     phone_number: str
     nin: Optional[str] = None
     state: str
-    role: str  # "client" or "artisan"
-
-
-class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
+    role: str
 
 
 class UserUpdate(BaseModel):
@@ -42,6 +40,25 @@ class UserUpdate(BaseModel):
     last_name: Optional[str] = None
     phone_number: Optional[str] = None
     state: Optional[str] = None
+    nin: Optional[str] = None
+
+
+class VerifyEmailSchema(BaseModel):
+    email: EmailStr
+    otp: str
+
+
+class ResendOTPSchema(BaseModel):
+    email: EmailStr
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    user_id: Optional[str] = None
 
 
 class UserResponse(BaseModel):
@@ -54,9 +71,5 @@ class UserResponse(BaseModel):
     state: str
     role: str
     is_active: bool
+    is_email_verified: bool
     created_at: datetime
-
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str = "bearer"

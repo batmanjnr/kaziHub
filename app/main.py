@@ -9,8 +9,9 @@ import dns.resolver
 # Monkey-patch for Beanie/Motor compatibility
 AsyncIOMotorClient.append_metadata = lambda self, *args, **kwargs: None
 
+# Route DNS queries through local gateway router to prevent Errno 51
 dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
-dns.resolver.default_resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+dns.resolver.default_resolver.nameservers = ["192.168.0.1"]
 
 from app.core.config import settings
 from app.models.user import User
