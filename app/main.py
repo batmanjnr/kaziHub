@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 import certifi
 from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi.middleware.cors import CORSMiddleware
 from beanie import init_beanie
 import dns.resolver
 
@@ -21,7 +22,7 @@ from app.api.v1.router import api_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize Motor client with certifi CA bundle for macOS SSL verification
+    # Initialize Motor client with certifi CA bundle
     client = AsyncIOMotorClient(
         settings.MONGODB_URL,
         tlsCAFile=certifi.where()
@@ -42,9 +43,20 @@ async def lifespan(app: FastAPI):
     client.close()
 
 
+# 1. Instantiate FastAPI first
 app = FastAPI(
     title=settings.PROJECT_NAME,
     lifespan=lifespan
 )
 
-app.include_router(api_router, prefix="/api/v1")
+# 2. Add CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 3. Include API Router
+app.include_router(api_router, prefix="/api")
