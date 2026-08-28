@@ -19,6 +19,9 @@ class User(Document):
     otp_expires_at: Optional[datetime] = None
     reset_otp_code: Optional[str] = None
     reset_otp_expires_at: Optional[datetime] = None
+    profile_picture: Optional[str] = None
+    theme: str = "system"  # "light", "dark", or "system"
+    preferred_language: str = "en"  # "en", "es", "fr", etc.
     created_at: datetime = datetime.utcnow()
 
     class Settings:
@@ -42,6 +45,9 @@ class UserUpdate(BaseModel):
     phone_number: Optional[str] = None
     state: Optional[str] = None
     nin: Optional[str] = None
+    profile_picture: Optional[str] = None
+    theme: Optional[str] = None
+    preferred_language: Optional[str] = None
 
 
 class VerifyEmailSchema(BaseModel):
@@ -73,4 +79,7 @@ class UserResponse(BaseModel):
     role: str
     is_active: bool
     is_email_verified: bool
+    profile_picture: Optional[str] = None
+    theme: str = "system"
+    preferred_language: str = "en"
     created_at: datetime

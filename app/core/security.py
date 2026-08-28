@@ -40,3 +40,14 @@ def create_access_token(
         to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM
     )
     return encoded_jwt
+
+
+def decode_access_token(token: str) -> Optional[dict]:
+    """Decode and validate a JWT access token."""
+    try:
+        payload = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
+        return payload
+    except jwt.PyJWTError:
+        return None

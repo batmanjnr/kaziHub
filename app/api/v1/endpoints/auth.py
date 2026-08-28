@@ -1,6 +1,8 @@
+import os
 import random
+import uuid
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 
 from app.api.deps import get_current_user
@@ -22,10 +24,33 @@ from app.services.email import send_otp_email, send_password_reset_email
 
 router = APIRouter()
 
+UPLOAD_DIR = "static/uploads/profiles"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 def generate_otp() -> str:
     """Generate a 5-digit numeric string."""
     return str(random.randint(10000, 99999))
+
+
+def build_user_response(user: User) -> UserResponse:
+    """Safely construct a UserResponse model including avatar and preferences."""
+    return UserResponse(
+        id=str(user.id),
+        first_name=user.first_name,
+        last_name=user.last_name,
+        email=user.email,
+        phone_number=user.phone_number,
+        nin=user.nin,
+        state=user.state,
+        role=user.role,
+        is_active=user.is_active,
+        is_email_verified=user.is_email_verified,
+        profile_picture=user.profile_picture,
+        theme=getattr(user, "theme", "system"),
+        preferred_language=getattr(user, "preferred_language", "en"),
+        created_at=user.created_at,
+    )
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -142,19 +167,7 @@ async def verify_email(payload: VerifyEmailSchema):
     # 3. Clean up staging record
     await pending_user.delete()
 
-    return UserResponse(
-        id=str(user.id),
-        first_name=user.first_name,
-        last_name=user.last_name,
-        email=user.email,
-        phone_number=user.phone_number,
-        nin=user.nin,
-        state=user.state,
-        role=user.role,
-        is_active=user.is_active,
-        is_email_verified=user.is_email_verified,
-        created_at=user.created_at,
-    )
+    return build_user_response(user)
 
 
 @router.post("/resend-otp", status_code=status.HTTP_200_OK)
@@ -282,19 +295,7 @@ async def reset_password(payload: ResetPasswordSchema):
 @router.get("/me", response_model=UserResponse)
 async def read_user_me(current_user: User = Depends(get_current_user)):
     """Fetch profile details for the currently logged-in user."""
-    return UserResponse(
-        id=str(current_user.id),
-        first_name=current_user.first_name,
-        last_name=current_user.last_name,
-        email=current_user.email,
-        phone_number=current_user.phone_number,
-        nin=current_user.nin,
-        state=current_user.state,
-        role=current_user.role,
-        is_active=current_user.is_active,
-        is_email_verified=current_user.is_email_verified,
-        created_at=current_user.created_at,
-    )
+    return build_user_response(current_user)
 
 
 @router.put("/me", response_model=UserResponse)
@@ -302,7 +303,7 @@ async def update_user_me(
     user_in: UserUpdate,
     current_user: User = Depends(get_current_user),
 ):
-    """Update user profile information for the currently logged-in user."""
+    """Update user profile details, theme preferences, or language."""
     update_data = user_in.model_dump(exclude_unset=True)
 
     if "password" in update_data:
@@ -310,25 +311,55 @@ async def update_user_me(
         if password:
             current_user.hashed_password = get_password_hash(password)
 
+    # Validate theme input if provided
+    if "theme" in update_data and update_data["theme"]:
+        allowed_themes = ["light", "dark", "system"]
+        if update_data["theme"].lower() not in allowed_themes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid theme. Must be one of {allowed_themes}",
+            )
+        update_data["theme"] = update_data["theme"].lower()
+
     for field, value in update_data.items():
         if hasattr(current_user, field) and value is not None:
             setattr(current_user, field, value)
 
     await current_user.save()
+    return build_user_response(current_user)
 
-    return UserResponse(
-        id=str(current_user.id),
-        first_name=current_user.first_name,
-        last_name=current_user.last_name,
-        email=current_user.email,
-        phone_number=current_user.phone_number,
-        nin=current_user.nin,
-        state=current_user.state,
-        role=current_user.role,
-        is_active=current_user.is_active,
-        is_email_verified=current_user.is_email_verified,
-        created_at=current_user.created_at,
-    )
+
+@router.post("/me/picture", response_model=UserResponse)
+async def upload_user_profile_picture(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a profile picture directly for the logged-in user."""
+    allowed_types = ["image/jpeg", "image/png", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only JPEG, PNG, or WEBP image formats are supported.",
+        )
+
+    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+    unique_filename = f"{uuid.uuid4().hex}.{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+
+    relative_path = f"/static/uploads/profiles/{unique_filename}"
+    current_user.profile_picture = relative_path
+    await current_user.save()
+
+    # Sync image with user's Profile document if one exists
+    profile = await Profile.find_one({"user.$id": current_user.id})
+    if profile:
+        await profile.set({"profile_picture": relative_path})
+
+    return build_user_response(current_user)
 
 
 @router.delete("/me", status_code=status.HTTP_200_OK)
