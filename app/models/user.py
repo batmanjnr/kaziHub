@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import List, Optional
 from beanie import Document, Indexed
 from pydantic import BaseModel, EmailStr
+from pymongo import IndexModel
 
 
 class User(Document):
@@ -25,6 +26,14 @@ class User(Document):
     # and are rejected if it no longer matches.
     token_version: int = 0
     nin_encrypted: Optional[bytes] = None
+    # Deterministic HMAC of the NIN — enforces one-account-per-NIN via the
+    # sparse unique index below, without the NIN itself ever being
+    # queryable or reversible from this value. Absent when no NIN was
+    # provided; `sparse=True` is critical here — a plain unique index on an
+    # optional field lets only one `null` document ever exist (this exact
+    # bug hit the old plaintext `nin` unique index and silently broke
+    # registration for every user after the first).
+    nin_hash: Optional[str] = None
     deleted_at: Optional[datetime] = None
     anonymized_at: Optional[datetime] = None
     hashed_password: str
@@ -44,6 +53,23 @@ class User(Document):
 
     class Settings:
         name = "users"
+        indexes = [
+            # FIX (live-DB testing): `sparse=True` alone isn't enough here —
+            # Beanie writes every Optional field explicitly, so a user
+            # without a NIN still gets a literal `nin_hash: null` in the
+            # stored document. MongoDB's sparse index only excludes a
+            # field that's genuinely *absent*, not one present with value
+            # null — so a plain sparse index still collided every no-NIN
+            # user against each other, the exact same bug this index was
+            # built to fix in the first place. A partial index with an
+            # explicit type filter is what actually only indexes real
+            # string hashes.
+            IndexModel(
+                [("nin_hash", 1)],
+                unique=True,
+                partialFilterExpression={"nin_hash": {"$type": "string"}},
+            ),
+        ]
 
     @property
     def is_deleted(self) -> bool:

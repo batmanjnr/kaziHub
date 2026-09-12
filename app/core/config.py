@@ -28,6 +28,30 @@ class Settings(BaseSettings):
 
     PAYSTACK_SECRET_KEY: str = ""
 
+    # FIX (high-assurance security review): previously kyc_upload_token.py
+    # signed its tokens with SECRET_KEY — the same secret used to sign JWTs.
+    # A single leaked secret would then let an attacker both forge access
+    # tokens AND forge KYC-upload ownership tokens. Each security context
+    # gets its own scoped key so a compromise of one doesn't cascade into
+    # the other. Falls back to SECRET_KEY only if unset, so existing
+    # deployments don't break before rotating in a dedicated value.
+    KYC_UPLOAD_TOKEN_SECRET: str = ""
+
+    # Blind-index key for enforcing one-account-per-NIN (anti-fraud) without
+    # ever storing or indexing the plaintext NIN. NIN itself stays
+    # AES-256-GCM encrypted (nin_encrypted, non-deterministic, unsearchable);
+    # this key produces a *deterministic* HMAC-SHA256 (nin_hash) so the same
+    # real NIN always hashes to the same value and a unique DB index can
+    # catch a second registration — but the hash can't be reversed back to
+    # the NIN. Its own dedicated key, same reasoning as KYC_UPLOAD_TOKEN_SECRET.
+    NIN_HASH_KEY: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    def model_post_init(self, __context) -> None:
+        if not self.KYC_UPLOAD_TOKEN_SECRET:
+            self.KYC_UPLOAD_TOKEN_SECRET = self.SECRET_KEY
+        if not self.NIN_HASH_KEY:
+            self.NIN_HASH_KEY = self.SECRET_KEY
 
 settings = Settings()

@@ -1,6 +1,6 @@
 # app/api/v1/endpoints/gigs.py
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
 from beanie import PydanticObjectId
 
 from app.api.deps import get_current_artisan, get_own_artisan_profile
@@ -67,8 +67,11 @@ async def create_gig(
 async def list_gigs(
     category: Optional[str] = None,
     tag: Optional[str] = None,
-    limit: int = 20,
-    skip: int = 0,
+    # FIX (security review): unbounded before — a client could pass an
+    # arbitrarily large `limit` and force the server to fetch/serialize
+    # the entire public gig catalog in one response.
+    limit: int = Query(default=20, ge=1, le=100),
+    skip: int = Query(default=0, ge=0),
 ):
     """Public endpoint to browse active service listings."""
     query = {"is_active": True}

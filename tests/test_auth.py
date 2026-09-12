@@ -135,3 +135,59 @@ async def test_build_user_response_masks_nin_and_exposes_roles():
     assert response.roles == ["client", "artisan"]
     assert response.is_admin is True
     assert response.nin_masked is None  # no NIN was set
+
+
+class FakeClient:
+    host = "203.0.113.1"
+
+
+class FakeRequest:
+    client = FakeClient()
+
+
+async def test_login_requires_totp_when_2fa_enabled():
+    """High-assurance security-review fix: 2FA being 'enabled' on a
+    non-admin account used to do nothing at all at login — only admin
+    routes checked it. Login must now demand a valid code."""
+    import pyotp
+    from fastapi import HTTPException
+    from fastapi.security import OAuth2PasswordRequestForm
+
+    from app.api.v1.endpoints.auth import login
+    from app.core.encryption import encrypt_str
+
+    secret = pyotp.random_base32()
+    user = await make_user(
+        email="totp_login@example.com",
+        two_factor_enabled=True,
+        two_factor_secret_encrypted=encrypt_str(secret),
+    )
+    form = OAuth2PasswordRequestForm(username=user.email, password="Passw0rd!")
+
+    # No code at all -> rejected, distinguishable "totp_required" signal.
+    with pytest.raises(HTTPException) as exc_info:
+        await login(FakeRequest(), form_data=form, totp_code=None)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail["code"] == "totp_required"
+
+    # Wrong code -> still rejected.
+    with pytest.raises(HTTPException) as exc_info:
+        await login(FakeRequest(), form_data=form, totp_code="000000")
+    assert exc_info.value.status_code == 401
+
+    # Correct code -> succeeds.
+    totp = pyotp.TOTP(secret)
+    result = await login(FakeRequest(), form_data=form, totp_code=totp.now())
+    assert result.access_token
+
+
+async def test_login_does_not_require_totp_when_2fa_disabled():
+    from fastapi.security import OAuth2PasswordRequestForm
+
+    from app.api.v1.endpoints.auth import login
+
+    user = await make_user(email="no2fa_login@example.com")
+    form = OAuth2PasswordRequestForm(username=user.email, password="Passw0rd!")
+
+    result = await login(FakeRequest(), form_data=form, totp_code=None)
+    assert result.access_token

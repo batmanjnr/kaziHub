@@ -26,6 +26,7 @@ from app.models.booking_status_history import BookingStatusHistory
 from app.models.chat import Conversation, Message
 from app.models.dispute import Dispute, DisputeCreate, DisputeResponse
 from app.models.gig import Gig
+from app.models.profile import Profile
 from app.models.transaction import Transaction, TransactionStatus, TransactionType
 from app.models.user import User
 from app.services.payouts import request_artisan_payout
@@ -331,18 +332,38 @@ async def buy_gig_item(
     if not artisan:
         raise HTTPException(status_code=404, detail="Artisan not found.")
 
+    # FIX (security audit): the booking's amount/escrow used to come
+    # straight from the client-supplied payload.amount with no cross-check
+    # against the gig's actual listed price — a client could buy any gig
+    # for an arbitrary (e.g. near-zero) amount. The gig's own price is now
+    # the sole source of truth for what gets charged.
+    try:
+        gig = await Gig.get(ObjectId(payload.gig_id))
+    except Exception:
+        gig = None
+    if not gig or not gig.is_active:
+        raise HTTPException(status_code=404, detail="Gig not found or no longer available.")
+
+    gig_profile_id = gig.artisan_profile.ref.id if hasattr(gig.artisan_profile, "ref") else gig.artisan_profile.id
+    gig_profile = await Profile.get(gig_profile_id)
+    if not gig_profile:
+        raise HTTPException(status_code=404, detail="Gig owner's profile not found.")
+    gig_artisan_id = gig_profile.user.ref.id if hasattr(gig_profile.user, "ref") else gig_profile.user.id
+    if str(gig_artisan_id) != str(artisan.id):
+        raise HTTPException(status_code=400, detail="This gig does not belong to the specified artisan.")
+
     booking = Booking(
         client=current_user,
         artisan=artisan,
         gig_id=payload.gig_id,
         booking_type=BookingType.GIG_PURCHASE,
         title=payload.item_title,
-        amount=payload.amount,
+        amount=gig.price,
         address=payload.delivery_address,
         landmark_hint=payload.landmark_hint,
         status=BookingStatus.ACCEPTED,
         reference_code=generate_reference_code(),
-        **compute_escrow_breakdown(payload.amount),
+        **compute_escrow_breakdown(gig.price),
     )
     await booking.insert()
     await BookingStatusHistory(
@@ -350,13 +371,10 @@ async def buy_gig_item(
     ).insert()
     await get_or_create_conversation(current_user, artisan, booking)
 
-    try:
-        gig = await Gig.get(ObjectId(payload.gig_id))
-        if gig:
-            gig.orders_count += 1
-            await gig.save()
-    except Exception:
-        pass
+    # NOTE (security audit): gig.orders_count is incremented when escrow is
+    # actually funded (wallet.py's _handle_charge_success), not here —
+    # incrementing it at mere booking creation let anyone manufacture fake
+    # "sold" counts for a gig without ever paying.
 
     response = build_booking_response(booking)
     await cache_response(
@@ -474,13 +492,19 @@ async def confirm_fund_escrow(
 @router.get("/me", response_model=List[BookingResponse])
 async def get_my_bookings(
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    # FIX (security review): previously unbounded — a long-lived account
+    # with thousands of bookings could force a very large response.
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     current_user: User = Depends(get_current_user),
 ):
     """Retrieve all bookings for current user, optionally filtered by status."""
     query: dict = {"$or": [{"client.$id": current_user.id}, {"artisan.$id": current_user.id}]}
     if status_filter:
         query["status"] = status_filter
-    bookings = await Booking.find(query).sort("-created_at").to_list()
+    bookings = (
+        await Booking.find(query).sort("-created_at").skip(offset).limit(limit).to_list()
+    )
     return [build_booking_response(b) for b in bookings]
 
 
@@ -589,8 +613,6 @@ async def core_confirm_completion(booking: Booking, current_user: User) -> Booki
     )
 
     try:
-        from app.models.profile import Profile
-
         profile = await Profile.find_one({"user.$id": booking.artisan.ref.id})
         if profile:
             profile.completed_jobs_count += 1
@@ -730,8 +752,20 @@ async def cancel_booking(
     if str(current_user.id) not in (c_id, a_id):
         raise HTTPException(status_code=403, detail="Not authorized.")
 
-    if booking.status in (BookingStatus.PAID_OUT, BookingStatus.COMPLETED_BY_ARTISAN):
-        raise HTTPException(status_code=400, detail="Cannot cancel a completed job.")
+    if booking.status in (
+        BookingStatus.PAID_OUT,
+        BookingStatus.COMPLETED_BY_ARTISAN,
+        BookingStatus.DISPUTED,
+    ):
+        # FIX (security audit): DISPUTED was missing here — a client could
+        # file a dispute and then immediately self-cancel to force their
+        # own full refund before an admin ever adjudicated it, completely
+        # bypassing resolve_dispute. Only an admin resolution can move a
+        # disputed booking out of that state now.
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel a completed or disputed job. Disputed bookings must be resolved by an admin.",
+        )
 
     updates = {
         "cancellation_reason": "Cancelled by user",
@@ -799,8 +833,15 @@ async def update_booking_status(
             changed_by=current_user,
         )
     elif status_update == BookingStatus.CANCELLED:
-        if booking.status in (BookingStatus.PAID_OUT, BookingStatus.COMPLETED_BY_ARTISAN):
-            raise HTTPException(status_code=400, detail="Cannot cancel completed job.")
+        if booking.status in (
+            BookingStatus.PAID_OUT,
+            BookingStatus.COMPLETED_BY_ARTISAN,
+            BookingStatus.DISPUTED,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot cancel a completed or disputed job. Disputed bookings must be resolved by an admin.",
+            )
         booking = await apply_booking_transition(
             booking.id, to_status=BookingStatus.CANCELLED, changed_by=current_user
         )

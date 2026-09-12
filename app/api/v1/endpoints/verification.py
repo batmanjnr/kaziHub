@@ -18,6 +18,7 @@ from app.models.verification import (
     VerificationSubmit,
 )
 from app.core.cloudinary import generate_signed_kyc_url, upload_private_file_to_cloudinary
+from app.core.kyc_upload_token import sign_kyc_upload, verify_kyc_upload_token
 from app.core.upload_validation import IMAGE_TYPES, validate_upload
 
 router = APIRouter()
@@ -30,10 +31,14 @@ async def upload_verification_document(
 ):
     """Upload a KYC document/selfie to Cloudinary's private delivery type
     (spec §9) — the returned public_id is not a usable URL by itself; pass
-    it to POST /verification/submit. Admins (and the applicant) later see
-    it via a 15-minute signed URL, never a permanent public link."""
+    it, along with the returned upload_token, to POST /verification/submit.
+    The token binds this public_id to the uploading user so it can't later
+    be claimed by a different account (security-audit fix). Admins (and the
+    applicant) see the file via a 15-minute signed URL, never a permanent
+    public link."""
     await validate_upload(file, allowed_types=IMAGE_TYPES)
     result = await upload_private_file_to_cloudinary(file, folder="kazihub/verifications")
+    result["upload_token"] = sign_kyc_upload(str(current_user.id), result["public_id"])
     return result
 
 
@@ -63,6 +68,21 @@ async def submit_verification(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Biometric consent is required to submit verification.",
+        )
+
+    # FIX (security audit): reject public_ids this user didn't just upload
+    # themselves — without this, any public_id an attacker had ever seen
+    # (e.g. embedded in a signed URL an admin viewed) could be replayed to
+    # claim someone else's ID photo/selfie as their own KYC submission.
+    user_id_str = str(current_user.id)
+    if not verify_kyc_upload_token(
+        verification_in.document_image_upload_token, user_id_str, verification_in.document_image_public_id
+    ) or not verify_kyc_upload_token(
+        verification_in.liveness_selfie_upload_token, user_id_str, verification_in.liveness_selfie_public_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upload verification failed — please re-upload your documents and try again.",
         )
 
     existing_verification = await Verification.find_one({"user.$id": current_user.id})

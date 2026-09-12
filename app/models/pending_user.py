@@ -11,6 +11,10 @@ class PendingUser(Document):
     phone_number: str
     # FIX: encrypted at rest — this is a government ID number, staged or not.
     nin_encrypted: Optional[bytes] = None
+    # Carried through to the real User document on verification (see
+    # app.core.nin_hash) — computed here, while the plaintext NIN is still
+    # in hand, since nin_encrypted alone can't be turned back into it.
+    nin_hash: Optional[str] = None
     state: str
     role: str
     hashed_password: str

@@ -41,10 +41,10 @@ uvloop==0.22.1
 watchfiles==1.2.0
 websockets==17.0.1
 wheel==0.48.0
-httpx
-cloudinary
-pyotp
-apscheduler
-pytest
-pytest-asyncio
-mongomock-motor
+httpx==0.28.1
+cloudinary==1.46.2
+pyotp==2.10.0
+APScheduler==3.11.3
+pytest==9.1.1
+pytest-asyncio==1.4.0
+mongomock-motor==0.0.36

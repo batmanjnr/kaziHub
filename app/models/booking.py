@@ -121,7 +121,9 @@ class GigPurchaseCreate(BaseModel):
     artisan_id: str
     gig_id: str
     item_title: str
-    amount: float
+    # No client-supplied amount: the booking's price is always taken from
+    # the gig's own listed price server-side (spec/security fix — a client
+    # could otherwise buy any gig for an arbitrary amount).
     delivery_address: str
     landmark_hint: Optional[str] = None
 

@@ -215,3 +215,123 @@ async def test_dispute_idempotency_key_replays_without_creating_second_dispute()
     assert first.id == second["id"]
     disputes = await Dispute.find({"booking.$id": booking.id}).to_list()
     assert len(disputes) == 1
+
+
+async def test_client_cannot_self_cancel_a_disputed_booking_for_a_refund():
+    """Security-audit fix: a client used to be able to dispute a booking
+    and then immediately self-cancel it for a full refund, completely
+    bypassing admin adjudication of the dispute."""
+    from fastapi import HTTPException
+
+    from app.api.v1.endpoints.bookings import cancel_booking
+
+    client = await make_user("cancelbypass_c@example.com")
+    artisan = await make_user("cancelbypass_a@example.com", role="artisan")
+    booking = await make_booking(
+        client, artisan, status=BookingStatus.DISPUTED, escrow_status=EscrowStatus.HELD_IN_ESCROW
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cancel_booking(str(booking.id), current_user=client)
+    assert exc_info.value.status_code == 400
+
+    unchanged = await Booking.get(booking.id)
+    assert unchanged.status == BookingStatus.DISPUTED
+    assert unchanged.escrow_status == EscrowStatus.HELD_IN_ESCROW
+
+
+async def test_buy_gig_ignores_client_supplied_amount_and_uses_gig_price():
+    """Security-audit fix: buy_gig_item used to trust a client-supplied
+    `amount` with no cross-check against the gig's real price, letting a
+    client buy any gig for an arbitrary amount."""
+    from app.api.v1.endpoints.bookings import buy_gig_item
+    from app.api.v1.endpoints.gigs import create_gig
+    from app.models.booking import GigPurchaseCreate
+    from app.models.gig import GigCreate
+    from app.models.profile import Profile
+
+    client = await make_user("gigprice_c@example.com")
+    artisan = await make_user("gigprice_a@example.com", role="artisan")
+    profile = Profile(user=artisan, category="carpentry", state="Lagos")
+    await profile.insert()
+
+    gig = await create_gig(
+        GigCreate(
+            title="Custom bookshelf",
+            description="Handmade oak bookshelf",
+            category="carpentry",
+            price=50000,
+            delivery_time_days=5,
+        ),
+        profile=profile,
+    )
+
+    payload_dict = {
+        "artisan_id": str(artisan.id),
+        "gig_id": gig.id,
+        "item_title": "Custom bookshelf",
+        "delivery_address": "12 Example Street",
+    }
+    booking = await buy_gig_item(
+        GigPurchaseCreate(**payload_dict),
+        current_user=client,
+        idempotency_key="gig-price-test",
+    )
+
+    assert booking.amount == 50000
+    assert booking.escrow_amount == 50000
+
+
+async def test_gig_orders_count_only_increments_on_real_payment_not_booking_creation():
+    """Security-audit fix: orders_count used to increment the instant a
+    booking was created, before any money moved — letting anyone
+    manufacture fake 'sold' counts for free by creating and abandoning
+    bookings. It must only increment once escrow is actually funded."""
+    from app.api.v1.endpoints.bookings import buy_gig_item
+    from app.api.v1.endpoints.gigs import create_gig
+    from app.api.v1.endpoints.wallet import _handle_charge_success
+    from app.models.booking import GigPurchaseCreate
+    from app.models.gig import Gig, GigCreate
+    from app.models.profile import Profile
+    from app.models.transaction import Transaction, TransactionStatus, TransactionType
+
+    client = await make_user("gigcount_c@example.com")
+    artisan = await make_user("gigcount_a@example.com", role="artisan")
+    profile = Profile(user=artisan, category="carpentry", state="Lagos")
+    await profile.insert()
+
+    gig = await create_gig(
+        GigCreate(
+            title="Custom shelf", description="desc", category="carpentry",
+            price=20000, delivery_time_days=3,
+        ),
+        profile=profile,
+    )
+
+    booking = await buy_gig_item(
+        GigPurchaseCreate(
+            artisan_id=str(artisan.id), gig_id=gig.id, item_title="Custom shelf",
+            delivery_address="1 Example Rd",
+        ),
+        current_user=client,
+        idempotency_key="gig-orders-count-test",
+    )
+
+    # No payment has happened yet — orders_count must still be 0.
+    unpaid_gig = await Gig.get(gig.id)
+    assert unpaid_gig.orders_count == 0
+
+    booking_doc = await Booking.get(booking.id)
+    tx = Transaction(
+        booking=booking_doc,
+        transaction_reference="KZ-ESCROW-gigcount",
+        amount=20000,
+        type=TransactionType.ESCROW_DEPOSIT,
+        status=TransactionStatus.PENDING,
+    )
+    await tx.insert()
+
+    await _handle_charge_success({"reference": "KZ-ESCROW-gigcount", "id": 1})
+
+    paid_gig = await Gig.get(gig.id)
+    assert paid_gig.orders_count == 1

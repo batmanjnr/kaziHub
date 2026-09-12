@@ -37,6 +37,36 @@ def _iter_key_candidates_with_dbref_support(key, doc):
 
 mongomock.filtering.iter_key_candidates = _iter_key_candidates_with_dbref_support
 
+# mongomock's Collection.create_indexes() (the plural form Beanie calls with
+# a list of pymongo IndexModel objects) hardcodes which options it forwards
+# to create_index() — unique/sparse/expireAfterSeconds/name, but NOT
+# partialFilterExpression. That option is silently dropped, so a partial
+# unique index (e.g. User.nin_hash, unique only when the field is an actual
+# string) behaves as a plain unique index in tests: every document without
+# the field collides on its shared null value. Real MongoDB has no such gap
+# — this only patches the in-memory test double.
+from mongomock.collection import Collection as _MongomockCollection
+
+
+def _create_indexes_with_partial_filter_support(self, indexes, session=None):
+    results = []
+    for index in indexes:
+        results.append(
+            self.create_index(
+                index.document["key"].items(),
+                session=session,
+                expireAfterSeconds=index.document.get("expireAfterSeconds"),
+                unique=index.document.get("unique", False),
+                sparse=index.document.get("sparse", False),
+                name=index.document.get("name"),
+                partialFilterExpression=index.document.get("partialFilterExpression"),
+            )
+        )
+    return results
+
+
+_MongomockCollection.create_indexes = _create_indexes_with_partial_filter_support
+
 from app.models.audit_log import AuditLog
 from app.models.bank_account import BankAccount
 from app.models.booking import Booking

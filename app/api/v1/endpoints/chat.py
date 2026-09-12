@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from bson import ObjectId
 from pydantic import BaseModel
 
@@ -261,14 +261,21 @@ async def start_or_get_conversation(
 
 
 @conversations_router.get("")
-async def get_my_conversations(current_user: User = Depends(get_current_user)):
+async def get_my_conversations(
+    # FIX (security review): previously unbounded.
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+):
     """Fetch user's inbox list."""
-    conversations = await Conversation.find({
-        "$or": [
-            {"client.$id": current_user.id},
-            {"artisan.$id": current_user.id}
-        ]
-    }).sort("-updated_at").to_list()
+    conversations = (
+        await Conversation.find({
+            "$or": [
+                {"client.$id": current_user.id},
+                {"artisan.$id": current_user.id}
+            ]
+        }).sort("-updated_at").skip(offset).limit(limit).to_list()
+    )
 
     return [
         {

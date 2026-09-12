@@ -39,7 +39,7 @@ async def verify_bank_account(
         resolved = await resolve_account_number(payload.account_number, payload.bank_code)
     except PaystackError as e:
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, detail=f"Could not verify bank account: {e}"
+            status.HTTP_400_BAD_REQUEST, detail=f"Could not verify bank account: {e.client_message()}"
         )
 
     account_name = resolved.get("account_name", "")
@@ -50,7 +50,7 @@ async def verify_bank_account(
         )
     except PaystackError as e:
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, detail=f"Could not register payout recipient: {e}"
+            status.HTTP_400_BAD_REQUEST, detail=f"Could not register payout recipient: {e.client_message()}"
         )
 
     existing = await BankAccount.find_one({"user.$id": current_artisan.id})

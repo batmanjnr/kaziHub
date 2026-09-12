@@ -10,8 +10,9 @@ from app.api.v1.endpoints.bookings import core_confirm_completion
 from app.core.config import settings
 from app.core.websocket_manager import manager
 from app.models.audit_log import AuditLog
-from app.models.booking import Booking, BookingStatus, EscrowStatus
+from app.models.booking import Booking, BookingStatus, BookingType, EscrowStatus
 from app.models.chat import Conversation
+from app.models.gig import Gig
 from app.models.notification import Notification
 from app.models.transaction import Transaction, TransactionStatus, TransactionType
 from app.models.user import User
@@ -62,7 +63,7 @@ async def initialize_escrow_payment(
             metadata={"booking_id": str(booking.id)},
         )
     except PaystackError as e:
-        raise HTTPException(status_code=400, detail=f"Payment initialization failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Payment initialization failed: {e.client_message()}")
 
     return {
         "authorization_url": data["authorization_url"],
@@ -104,6 +105,18 @@ async def _handle_charge_success(data: dict) -> None:
         },
         to_status=BookingStatus.ESCROW_FUNDED,
     )
+
+    # Counted here (real payment confirmed), not at booking creation —
+    # security-audit fix: incrementing it earlier let anyone manufacture
+    # fake "sold" counts for a gig without ever paying.
+    if booking.booking_type == BookingType.GIG_PURCHASE and booking.gig_id:
+        try:
+            gig = await Gig.get(ObjectId(booking.gig_id))
+            if gig:
+                gig.orders_count += 1
+                await gig.save()
+        except Exception:
+            pass
 
     conv = await Conversation.find_one({
         "client.$id": booking.client.ref.id,
@@ -199,7 +212,11 @@ async def paystack_webhook(request: Request, x_paystack_signature: str = Header(
         hashlib.sha256
     ).hexdigest()
 
-    if hash_sig != x_paystack_signature:
+    # FIX (security audit): a plain `!=` string comparison short-circuits on
+    # the first differing byte, which is the textbook timing side-channel
+    # for MAC/signature verification. hmac.compare_digest runs in constant
+    # time regardless of where the strings first differ.
+    if not hmac.compare_digest(hash_sig, x_paystack_signature or ""):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     event_data = await request.json()

@@ -65,20 +65,33 @@ def generate_signed_kyc_url(public_id: str, format: str = "jpg", expires_in_seco
 
 
 async def delete_file_from_cloudinary(public_id_or_url: str):
-    """Deletes a file from Cloudinary given its public_id or full URL."""
-    # If it's a URL, extract public_id
+    """Deletes a file from Cloudinary given its public_id or full URL.
+
+    FIX (live-environment testing): Cloudinary's destroy API doesn't accept
+    resource_type="auto" — that value is only meaningful for uploads
+    (auto-detect on the way in). Every call to destroy() with "auto"
+    previously failed with a 400 from Cloudinary itself, crashing every
+    caller (portfolio deletion, profile-picture replacement, moderation-
+    reject cleanup) with an unhandled 500. This bug predates this session
+    and was only caught by testing against the real Cloudinary API — it
+    can't be exercised by the mocked test suite.
+    """
+    resource_type = "image"
+    # If it's a URL, extract both public_id and the resource_type actually
+    # embedded in the URL path, rather than guessing.
     if public_id_or_url.startswith("http"):
-        # Assuming URL structure: https://res.cloudinary.com/.../image/upload/v1234567890/folder/public_id
+        # URL structure: https://res.cloudinary.com/<cloud>/<resource_type>/<type>/v<version>/<public_id>
         path = urlparse(public_id_or_url).path
-        # Path looks like: /<cloud_name>/<resource_type>/<type>/<version>/<public_id>
         parts = path.split('/')
+        if len(parts) > 2 and parts[2] in ("image", "video", "raw"):
+            resource_type = parts[2]
         # Extract public_id, removing extension if present
         public_id = "/".join(parts[5:]).rsplit('.', 1)[0]
     else:
         public_id = public_id_or_url
-        
+
     await asyncio.to_thread(
         cloudinary.uploader.destroy,
         public_id,
-        resource_type="auto"
+        resource_type=resource_type,
     )

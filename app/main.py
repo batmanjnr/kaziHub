@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.rate_limit import GlobalRateLimitMiddleware
+from app.core.security_headers import SecurityHeadersMiddleware
 from app.models.audit_log import AuditLog
 from app.models.bank_account import BankAccount
 from app.models.booking import Booking
@@ -101,6 +102,9 @@ app.add_middleware(
 
 # 3b. Baseline per-IP rate limit across the whole API (spec §3)
 app.add_middleware(GlobalRateLimitMiddleware)
+
+# 3c. Baseline security response headers (security-review fix)
+app.add_middleware(SecurityHeadersMiddleware)
 
 # 4. Include API Router
 app.include_router(api_router, prefix="/api/v1")

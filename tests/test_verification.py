@@ -9,6 +9,7 @@ from app.api.v1.endpoints.verification import (
     submit_verification,
     upload_verification_document,
 )
+from app.core.kyc_upload_token import sign_kyc_upload
 from app.core.security import get_password_hash
 from app.models.audit_log import AuditLog
 from app.models.notification import Notification
@@ -34,17 +35,32 @@ async def make_user(email, is_admin=False) -> User:
     return user
 
 
+def make_submission(
+    user: User,
+    doc_public_id: str = "kazihub/verifications/id-a",
+    selfie_public_id: str = "kazihub/verifications/selfie-a",
+    **overrides,
+) -> VerificationSubmit:
+    """Builds a VerificationSubmit with valid upload tokens for the given
+    user, as if they'd just uploaded via POST /verification/upload."""
+    fields = dict(
+        document_type="nin",
+        document_number="12345678901",
+        document_image_public_id=doc_public_id,
+        document_image_upload_token=sign_kyc_upload(str(user.id), doc_public_id),
+        liveness_selfie_public_id=selfie_public_id,
+        liveness_selfie_upload_token=sign_kyc_upload(str(user.id), selfie_public_id),
+        biometric_consent=True,
+    )
+    fields.update(overrides)
+    return VerificationSubmit(**fields)
+
+
 async def test_submit_requires_biometric_consent():
     user = await make_user("kyc1@example.com")
     with pytest.raises(HTTPException) as exc_info:
         await submit_verification(
-            VerificationSubmit(
-                document_type="nin",
-                document_number="12345678901",
-                document_image_public_id="kazihub/verifications/id-a",
-                liveness_selfie_public_id="kazihub/verifications/selfie-a",
-                biometric_consent=False,
-            ),
+            make_submission(user, biometric_consent=False),
             current_user=user,
         )
     assert exc_info.value.status_code == 400
@@ -57,13 +73,7 @@ async def test_review_approval_writes_audit_log_and_notification_and_verifies_pr
     await profile.insert()
 
     submitted = await submit_verification(
-        VerificationSubmit(
-            document_type="nin",
-            document_number="98765432109",
-            document_image_public_id="kazihub/verifications/id-a",
-            liveness_selfie_public_id="kazihub/verifications/selfie-a",
-            biometric_consent=True,
-        ),
+        make_submission(applicant, document_number="98765432109"),
         current_user=applicant,
     )
 
@@ -93,13 +103,7 @@ async def test_review_rejection_does_not_verify_profile_but_still_logs():
     await profile.insert()
 
     submitted = await submit_verification(
-        VerificationSubmit(
-            document_type="nin",
-            document_number="11122233344",
-            document_image_public_id="kazihub/verifications/id-a",
-            liveness_selfie_public_id="kazihub/verifications/selfie-a",
-            biometric_consent=True,
-        ),
+        make_submission(applicant, document_number="11122233344"),
         current_user=applicant,
     )
 
@@ -122,13 +126,7 @@ async def test_non_admin_cannot_review():
     non_admin = await make_user("notadmin@example.com", is_admin=False)
 
     submitted = await submit_verification(
-        VerificationSubmit(
-            document_type="nin",
-            document_number="55566677788",
-            document_image_public_id="kazihub/verifications/id-a",
-            liveness_selfie_public_id="kazihub/verifications/selfie-a",
-            biometric_consent=True,
-        ),
+        make_submission(applicant, document_number="55566677788"),
         current_user=applicant,
     )
 
@@ -148,22 +146,16 @@ async def test_verification_queue_lists_pending_only():
     admin = await make_user("admin3@example.com", is_admin=True)
 
     await submit_verification(
-        VerificationSubmit(
-            document_type="nin",
-            document_number="10101010101",
-            document_image_public_id="kazihub/verifications/id-a",
-            liveness_selfie_public_id="kazihub/verifications/selfie-a",
-            biometric_consent=True,
-        ),
+        make_submission(applicant1, document_number="10101010101"),
         current_user=applicant1,
     )
     submitted2 = await submit_verification(
-        VerificationSubmit(
+        make_submission(
+            applicant2,
+            doc_public_id="kazihub/verifications/id-b",
+            selfie_public_id="kazihub/verifications/selfie-b",
             document_type="passport",
             document_number="20202020202",
-            document_image_public_id="kazihub/verifications/id-b",
-            liveness_selfie_public_id="kazihub/verifications/selfie-b",
-            biometric_consent=True,
         ),
         current_user=applicant2,
     )
@@ -185,4 +177,40 @@ async def test_upload_rejects_disallowed_content_type():
     user = await make_user("kyc7@example.com")
     with pytest.raises(HTTPException) as exc_info:
         await upload_verification_document(file=FakeUploadFile(), current_user=user)
+    assert exc_info.value.status_code == 400
+
+
+async def test_cannot_submit_a_stolen_public_id_without_its_matching_token():
+    """Security-audit fix: an attacker who has seen someone else's
+    public_id (e.g. embedded in a signed URL an admin viewed) but doesn't
+    have *their* upload_token can't claim it as their own KYC submission."""
+    owner = await make_user("kyc8_owner@example.com")
+    attacker = await make_user("kyc8_attacker@example.com")
+
+    stolen_public_id = "kazihub/verifications/owners-id-photo"
+    # Attacker builds a submission around their own legitimately-uploaded
+    # public_id/token, then swaps in the stolen public_id afterward without
+    # a matching token for it — exactly what a tampered request would do.
+    submission = make_submission(attacker, doc_public_id="kazihub/verifications/attackers-own-photo")
+    submission.document_image_public_id = stolen_public_id
+
+    with pytest.raises(HTTPException) as exc_info:
+        await submit_verification(submission, current_user=attacker)
+    assert exc_info.value.status_code == 400
+
+
+async def test_upload_token_is_rejected_when_replayed_by_a_different_user():
+    """Even a genuinely valid token is scoped to the user it was issued
+    for — replaying it from another account must fail."""
+    owner = await make_user("kyc9_owner@example.com")
+    other = await make_user("kyc9_other@example.com")
+
+    public_id = "kazihub/verifications/some-id-photo"
+    owners_token = sign_kyc_upload(str(owner.id), public_id)
+
+    submission = make_submission(other, doc_public_id=public_id)
+    submission.document_image_upload_token = owners_token
+
+    with pytest.raises(HTTPException) as exc_info:
+        await submit_verification(submission, current_user=other)
     assert exc_info.value.status_code == 400

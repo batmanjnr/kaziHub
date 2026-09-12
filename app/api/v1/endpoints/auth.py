@@ -5,7 +5,7 @@ from typing import Optional
 from uuid import uuid4
 
 import pyotp
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
@@ -13,7 +13,9 @@ from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.cloudinary import delete_file_from_cloudinary, upload_file_to_cloudinary
 from app.core.encryption import decrypt_optional, encrypt_optional, encrypt_str, mask_tail
+from app.core.nin_hash import compute_nin_hash
 from app.core.rate_limit import rate_limiter
+from app.core.two_factor import verify_totp_code
 from app.core.upload_validation import IMAGE_TYPES, validate_upload
 from app.services.moderation import moderate_image
 from app.core.security import (
@@ -127,8 +129,14 @@ async def deactivate_account(user: User) -> None:
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(user_in: UserCreate, background_tasks: BackgroundTasks):
+async def register(request: Request, user_in: UserCreate, background_tasks: BackgroundTasks):
     """Stage a new registration and send OTP without writing to main User DB."""
+    # FIX (security review): unrate-limited before — an attacker could spam
+    # this endpoint with arbitrary victim emails, using Kazihub's own SMTP
+    # sender as a spam relay (each call sends a real OTP email) even though
+    # they'd never receive the OTP themselves.
+    rate_limiter.hit(f"register:{get_client_ip(request)}", limit=10, window_seconds=3600)
+
     # Check if email is already registered and verified
     existing_user = await User.find_one(User.email == user_in.email)
     if existing_user:
@@ -141,6 +149,17 @@ async def register(user_in: UserCreate, background_tasks: BackgroundTasks):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Role must be either 'client' or 'artisan'.",
+        )
+
+    # One account per NIN (anti-fraud): checked here for a fast, clear
+    # error; the sparse unique index on User.nin_hash is the authoritative
+    # enforcement (verify_email below handles the race if two pending
+    # registrations somehow reach it with the same NIN at once).
+    nin_hash = compute_nin_hash(user_in.nin) if user_in.nin else None
+    if nin_hash and await User.find_one(User.nin_hash == nin_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An account already exists for this NIN.",
         )
 
     otp = generate_otp()
@@ -157,6 +176,7 @@ async def register(user_in: UserCreate, background_tasks: BackgroundTasks):
         pending_user.last_name = user_in.last_name
         pending_user.phone_number = user_in.phone_number
         pending_user.nin_encrypted = nin_encrypted
+        pending_user.nin_hash = nin_hash
         pending_user.state = user_in.state
         pending_user.role = user_in.role.lower()
         pending_user.hashed_password = get_password_hash(user_in.password)
@@ -172,6 +192,7 @@ async def register(user_in: UserCreate, background_tasks: BackgroundTasks):
             email=user_in.email,
             phone_number=user_in.phone_number,
             nin_encrypted=nin_encrypted,
+            nin_hash=nin_hash,
             state=user_in.state,
             role=user_in.role.lower(),
             hashed_password=get_password_hash(user_in.password),
@@ -238,6 +259,7 @@ async def verify_email(payload: VerifyEmailSchema):
         email=pending_user.email,
         phone_number=pending_user.phone_number,
         nin_encrypted=pending_user.nin_encrypted,
+        nin_hash=pending_user.nin_hash,
         state=pending_user.state,
         role=pending_user.role,
         roles=roles,
@@ -245,7 +267,19 @@ async def verify_email(payload: VerifyEmailSchema):
         is_email_verified=True,
         created_at=pending_user.created_at,
     )
-    await user.insert()
+    try:
+        await user.insert()
+    except Exception as e:
+        # Race: two pending registrations with the same NIN both reached
+        # this point before either completed. The sparse unique index on
+        # nin_hash is what actually caught it — surface a clean error
+        # instead of a raw 500.
+        if "nin_hash" in str(e) and "duplicate key" in str(e).lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="An account already exists for this NIN.",
+            )
+        raise
 
     # 2. Grant capability rows (spec §2/§4.2) — every account implicitly
     # holds 'client'; 'artisan' is granted alongside it here since this
@@ -298,8 +332,20 @@ async def resend_otp(payload: ResendOTPSchema, background_tasks: BackgroundTasks
 
 
 @router.post("/login", response_model=TokenPair)
-async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
-    """Authenticate user and return an access/refresh token pair."""
+async def login(
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    totp_code: Optional[str] = Form(default=None),
+):
+    """Authenticate user and return an access/refresh token pair.
+
+    FIX (high-assurance security review): a user who opted into 2FA via
+    /auth/2fa/verify previously got no actual protection from it — nothing
+    in the login path checked `two_factor_enabled` at all, only admin-only
+    routes did (via get_current_admin). The flag was cosmetic for every
+    non-admin account. Login now requires a valid TOTP code whenever the
+    account has 2FA enabled, regardless of role.
+    """
     ip = get_client_ip(request)
     rate_limiter.hit(f"login:{ip}:{form_data.username}", limit=5, window_seconds=900)
 
@@ -321,6 +367,14 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Inactive account",
         )
+
+    if user.two_factor_enabled:
+        if not totp_code:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"code": "totp_required", "message": "Enter your 2FA code to continue."},
+            )
+        verify_totp_code(user, totp_code)
 
     return await issue_token_pair(user)
 
@@ -492,7 +546,16 @@ async def update_user_me(
 
     if "nin" in update_data:
         nin_value = update_data.pop("nin")
+        new_hash = compute_nin_hash(nin_value) if nin_value else None
+        if new_hash and new_hash != current_user.nin_hash:
+            existing = await User.find_one(User.nin_hash == new_hash)
+            if existing and str(existing.id) != str(current_user.id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="An account already exists for this NIN.",
+                )
         current_user.nin_encrypted = encrypt_optional(nin_value)
+        current_user.nin_hash = new_hash
 
     # Validate theme input if provided
     if "theme" in update_data and update_data["theme"]:

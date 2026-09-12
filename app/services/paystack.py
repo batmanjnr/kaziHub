@@ -4,6 +4,7 @@ that talks to Paystack, so deposit init, NUBAN verification, and payouts all
 share the same auth header and error handling instead of each reimplementing
 the httpx call.
 """
+import logging
 from typing import Optional
 
 import httpx
@@ -11,12 +12,25 @@ import httpx
 from app.core.config import settings
 
 BASE_URL = "https://api.paystack.co"
+logger = logging.getLogger("kazihub.paystack")
 
 
 class PaystackError(Exception):
-    def __init__(self, message: str, response_data: Optional[dict] = None):
+    """`safe_to_expose` distinguishes a business error Paystack itself
+    returned (e.g. "Invalid account number" — fine to show the caller) from
+    a transport/network failure (connection refused, DNS, timeout — could
+    embed internal hostnames/paths and must never reach an API response;
+    security-review fix). Callers should only interpolate this exception's
+    message into a client-facing detail when `safe_to_expose` is True.
+    """
+
+    def __init__(self, message: str, response_data: Optional[dict] = None, safe_to_expose: bool = True):
         super().__init__(message)
         self.response_data = response_data or {}
+        self.safe_to_expose = safe_to_expose
+
+    def client_message(self) -> str:
+        return str(self) if self.safe_to_expose else "The payment provider is temporarily unavailable."
 
 
 def _headers() -> dict:
@@ -33,10 +47,11 @@ async def _request(method: str, path: str, **kwargs) -> dict:
             res = await client.request(method, url, headers=_headers(), **kwargs)
             data = res.json()
     except httpx.HTTPError as e:
-        raise PaystackError(f"Network error contacting Paystack: {e}")
+        logger.error("Paystack transport error calling %s: %s", path, e)
+        raise PaystackError("Network error contacting Paystack", safe_to_expose=False)
 
     if not data.get("status"):
-        raise PaystackError(data.get("message", "Paystack request failed"), data)
+        raise PaystackError(data.get("message", "Paystack request failed"), data, safe_to_expose=True)
     return data
 
 

@@ -55,6 +55,12 @@ class VerificationSubmit(BaseModel):
     document_image_format: str = "jpg"
     liveness_selfie_public_id: str
     liveness_selfie_format: str = "jpg"
+    # FIX (security audit): binds each public_id to the uploading user, so a
+    # public_id seen elsewhere (e.g. embedded in a signed URL an admin
+    # viewed) can't be replayed by a different account. Also from the
+    # /upload response.
+    document_image_upload_token: str
+    liveness_selfie_upload_token: str
     biometric_consent: bool
 
 
