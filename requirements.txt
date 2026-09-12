@@ -42,3 +42,9 @@ watchfiles==1.2.0
 websockets==17.0.1
 wheel==0.48.0
 httpx
+cloudinary
+pyotp
+apscheduler
+pytest
+pytest-asyncio
+mongomock-motor

@@ -1,4 +1,6 @@
 # app/core/security.py
+import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import bcrypt
@@ -51,3 +53,15 @@ def decode_access_token(token: str) -> Optional[dict]:
         return payload
     except jwt.PyJWTError:
         return None
+
+
+def generate_refresh_token() -> str:
+    """A high-entropy opaque token — deliberately not a JWT, since its only
+    job is to be looked up by hash in user_sessions."""
+    return secrets.token_urlsafe(48)
+
+
+def hash_refresh_token(token: str) -> str:
+    """Refresh tokens are stored hashed (spec §3) so a DB read alone can't
+    be replayed as a live session."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

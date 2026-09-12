@@ -3,30 +3,37 @@ from enum import Enum
 from typing import Optional
 from beanie import Document, Link
 from app.models.booking import Booking
-from app.models.user import User
 
 
 class TransactionType(str, Enum):
     ESCROW_DEPOSIT = "escrow_deposit"
     ESCROW_RELEASE = "escrow_release"
     REFUND = "refund"
+    PLATFORM_FEE = "platform_fee"
+    GATEWAY_FEE = "gateway_fee"
 
 
 class TransactionStatus(str, Enum):
     PENDING = "pending"
     SUCCESSFUL = "successful"
     FAILED = "failed"
+    REVERSED = "reversed"
 
 
 class Transaction(Document):
-    user: Link[User]
     booking: Link[Booking]
-    reference: str
+    # FIX: renamed from `reference` to match spec's `transaction_reference` —
+    # this is the escrow_transactions ledger, keyed only to a booking (no
+    # user_id column in the spec table).
+    transaction_reference: str
+    gateway: str = "paystack"
     amount: float
+    currency: str = "NGN"
     type: TransactionType
     status: TransactionStatus = TransactionStatus.PENDING
-    gateway_response: Optional[str] = None
+    gateway_response: Optional[dict] = None
     created_at: datetime = datetime.utcnow()
 
     class Settings:
-        name = "transactions"
+        name = "escrow_transactions"
+        indexes = ["transaction_reference", "booking"]
