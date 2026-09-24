@@ -1,10 +1,11 @@
 import os
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import List, Optional
 from uuid import uuid4
 
 import pyotp
+from beanie import PydanticObjectId
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -37,8 +38,14 @@ from app.models.user import (
     VerifyEmailSchema,
 )
 from app.models.user_role import UserRole
-from app.schemas.auth import ForgotPasswordSchema, ResetPasswordSchema
-from app.services.email import send_otp_email, send_password_reset_email
+from app.schemas.auth import (
+    ChangePasswordSchema,
+    ConfirmEmailChangeSchema,
+    ForgotPasswordSchema,
+    RequestEmailChangeSchema,
+    ResetPasswordSchema,
+)
+from app.services.email import send_email_change_otp, send_otp_email, send_password_reset_email
 
 router = APIRouter()
 
@@ -90,7 +97,9 @@ def build_user_response(user: User) -> UserResponse:
     )
 
 
-async def issue_token_pair(user: User, family_id: Optional[str] = None) -> TokenPair:
+async def issue_token_pair(
+    user: User, family_id: Optional[str] = None, request: Optional[Request] = None
+) -> TokenPair:
     """Issue a new access/refresh pair. Passing `family_id` continues an
     existing rotation chain (refresh); omitting it starts a new one (login)."""
     access_token = create_access_token(
@@ -104,12 +113,15 @@ async def issue_token_pair(user: User, family_id: Optional[str] = None) -> Token
     )
 
     refresh_token = generate_refresh_token()
+    now = datetime.now(timezone.utc)
     session = UserSession(
         user=user,
         refresh_token_hash=hash_refresh_token(refresh_token),
         family_id=family_id or str(uuid4()),
-        expires_at=datetime.now(timezone.utc)
-        + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        expires_at=now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        user_agent=request.headers.get("user-agent") if request else None,
+        ip_address=get_client_ip(request) if request else None,
+        last_used_at=now,
     )
     await session.insert()
 
@@ -376,11 +388,11 @@ async def login(
             )
         verify_totp_code(user, totp_code)
 
-    return await issue_token_pair(user)
+    return await issue_token_pair(user, request=request)
 
 
 @router.post("/refresh", response_model=TokenPair)
-async def refresh_token(payload: RefreshRequest):
+async def refresh_token(payload: RefreshRequest, request: Request):
     """Exchange a refresh token for a new pair, rotating it in the process.
 
     Reuse of an already-rotated (revoked) refresh token is treated as
@@ -429,7 +441,7 @@ async def refresh_token(payload: RefreshRequest):
     session.is_revoked = True
     await session.save()
 
-    return await issue_token_pair(user, family_id=session.family_id)
+    return await issue_token_pair(user, family_id=session.family_id, request=request)
 
 
 @router.post("/revoke-sessions", status_code=status.HTTP_200_OK)
@@ -675,3 +687,208 @@ async def verify_two_factor_setup(
     current_user.two_factor_enabled = True
     await current_user.save()
     return {"detail": "Two-factor authentication enabled."}
+
+
+# ==========================================
+# CHANGE PASSWORD
+# ==========================================
+
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+async def change_password(
+    payload: ChangePasswordSchema, current_user: User = Depends(get_current_user)
+):
+    """Change the password for an already-authenticated user (current +
+    new password), distinct from the forgot/reset-password OTP flow."""
+    if not verify_password(payload.current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect."
+        )
+    if len(payload.new_password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be at least 8 characters.",
+        )
+
+    current_user.hashed_password = get_password_hash(payload.new_password)
+    # Same rationale as reset-password: a password change invalidates any
+    # other live sessions in case the old password had leaked.
+    current_user.token_version += 1
+    await current_user.save()
+    await revoke_all_sessions_for(current_user)
+
+    return {"detail": "Password changed successfully. Please log in again."}
+
+
+# ==========================================
+# ACTIVE DEVICES & SESSIONS
+# ==========================================
+
+class SessionResponse(BaseModel):
+    id: str
+    user_agent: Optional[str] = None
+    ip_address: Optional[str] = None
+    created_at: datetime
+    last_used_at: datetime
+    expires_at: datetime
+
+
+@router.get("/sessions", response_model=List[SessionResponse])
+async def list_sessions(current_user: User = Depends(get_current_user)):
+    """List this user's active (non-revoked, unexpired) refresh-token
+    sessions, so the client can render 'Active Devices & Sessions'."""
+    now = datetime.now(timezone.utc)
+    sessions = await UserSession.find(
+        {"user.$id": current_user.id, "is_revoked": False, "expires_at": {"$gt": now}}
+    ).sort("-last_used_at").to_list()
+    return [
+        SessionResponse(
+            id=str(s.id),
+            user_agent=s.user_agent,
+            ip_address=s.ip_address,
+            created_at=s.created_at,
+            last_used_at=s.last_used_at,
+            expires_at=s.expires_at,
+        )
+        for s in sessions
+    ]
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_200_OK)
+async def revoke_session(session_id: str, current_user: User = Depends(get_current_user)):
+    """Revoke a single session by id (e.g. 'log out that device')."""
+    try:
+        session = await UserSession.get(PydanticObjectId(session_id))
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid session ID.")
+
+    session_owner_id = (
+        session.user.ref.id if session and hasattr(session.user, "ref") else (session.user.id if session else None)
+    )
+    if not session or str(session_owner_id) != str(current_user.id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+
+    session.is_revoked = True
+    await session.save()
+    return {"detail": "Session revoked."}
+
+
+# ==========================================
+# FREEZE / UNFREEZE ACCOUNT (self-service, reversible)
+# ==========================================
+
+@router.post("/freeze-me", status_code=status.HTTP_200_OK)
+async def freeze_me(current_user: User = Depends(get_current_user)):
+    """Pause the account: drops any artisan profile out of search and
+    blocks new bookings, but — unlike /deactivate-me — login still works,
+    which is how the user reverses this via /unfreeze-me."""
+    current_user.is_paused = True
+    await current_user.save()
+
+    profile = await Profile.find_one({"user.$id": current_user.id})
+    if profile:
+        await profile.set({"is_paused": True})
+
+    return {"detail": "Account frozen. Log in and call /auth/unfreeze-me to reverse this."}
+
+
+@router.post("/unfreeze-me", status_code=status.HTTP_200_OK)
+async def unfreeze_me(current_user: User = Depends(get_current_user)):
+    current_user.is_paused = False
+    await current_user.save()
+
+    profile = await Profile.find_one({"user.$id": current_user.id})
+    if profile:
+        await profile.set({"is_paused": False})
+
+    return {"detail": "Account unfrozen."}
+
+
+# ==========================================
+# CHANGE EMAIL (security-sensitive: OTP-gated to the new address)
+# ==========================================
+
+@router.post("/change-email", status_code=status.HTTP_200_OK)
+async def request_email_change(
+    payload: RequestEmailChangeSchema,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
+    """Start an email change: verifies the current password, then sends an
+    OTP to the NEW address. The email only actually changes once that OTP
+    is confirmed via /change-email/confirm, proving the user controls it."""
+    if not verify_password(payload.current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect."
+        )
+
+    existing = await User.find_one(User.email == payload.new_email)
+    if existing and str(existing.id) != str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="That email is already in use."
+        )
+
+    otp = generate_otp()
+    current_user.pending_email = payload.new_email
+    current_user.email_change_otp = otp
+    current_user.email_change_otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    current_user.email_change_otp_attempts = 0
+    await current_user.save()
+
+    background_tasks.add_task(send_email_change_otp, payload.new_email, otp)
+
+    return {"detail": "Confirmation code sent to the new email address."}
+
+
+@router.post("/change-email/confirm", response_model=UserResponse)
+async def confirm_email_change(
+    payload: ConfirmEmailChangeSchema, current_user: User = Depends(get_current_user)
+):
+    if not current_user.pending_email or not current_user.email_change_otp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending email change. Call /auth/change-email first.",
+        )
+
+    if current_user.email_change_otp != payload.otp:
+        current_user.email_change_otp_attempts += 1
+        if current_user.email_change_otp_attempts >= MAX_OTP_ATTEMPTS:
+            current_user.pending_email = None
+            current_user.email_change_otp = None
+            current_user.email_change_otp_expires_at = None
+            await current_user.save()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Too many failed attempts. Please request a new code.",
+            )
+        await current_user.save()
+        remaining = MAX_OTP_ATTEMPTS - current_user.email_change_otp_attempts
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid code. {remaining} attempt(s) remaining.",
+        )
+
+    now = datetime.now(timezone.utc)
+    expires_at = current_user.email_change_otp_expires_at
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at is None or now > expires_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Code has expired. Please request a new one.",
+        )
+
+    existing = await User.find_one(User.email == current_user.pending_email)
+    if existing and str(existing.id) != str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="That email is already in use."
+        )
+
+    current_user.email = current_user.pending_email
+    current_user.is_email_verified = True
+    current_user.pending_email = None
+    current_user.email_change_otp = None
+    current_user.email_change_otp_expires_at = None
+    current_user.email_change_otp_attempts = 0
+    await current_user.save()
+
+    return build_user_response(current_user)

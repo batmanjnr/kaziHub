@@ -19,6 +19,15 @@ class User(Document):
     roles: List[str] = []
     is_admin: bool = False
     is_frozen: bool = False
+    # Self-service "freeze account" (distinct from `is_frozen`, which is
+    # the admin-suspend flag and blocks login entirely). A paused user can
+    # still log in — that's how they unfreeze themselves — but their
+    # artisan profile drops out of search and can't receive new bookings.
+    is_paused: bool = False
+    pending_email: Optional[str] = None
+    email_change_otp: Optional[str] = None
+    email_change_otp_expires_at: Optional[datetime] = None
+    email_change_otp_attempts: int = 0
     two_factor_enabled: bool = False
     two_factor_secret_encrypted: Optional[bytes] = None
     # Bumped whenever an admin suspends/reactivates the account or the user
@@ -129,6 +138,8 @@ class UserResponse(BaseModel):
     is_admin: bool = False
     is_active: bool
     is_email_verified: bool
+    is_paused: bool = False
+    two_factor_enabled: bool = False
     profile_picture: Optional[str] = None
     theme: str = "system"
     preferred_language: str = "en"

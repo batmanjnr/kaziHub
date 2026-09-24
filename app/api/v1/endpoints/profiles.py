@@ -1,4 +1,5 @@
 # app/api/v1/endpoints/profiles.py
+import asyncio
 from typing import List, Optional
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -23,10 +24,14 @@ MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
 
 
-def build_profile_response(profile: Profile) -> ProfileResponse:
+def build_profile_response(profile: Profile, for_owner: bool = True) -> ProfileResponse:
     user_id = str(
         profile.user.ref.id if hasattr(profile.user, "ref") else profile.user.id
     )
+
+    # The owner always sees their own neighborhood; public callers (search
+    # results, profile detail) only see it when share_neighborhood is on.
+    show_neighborhood = for_owner or profile.share_neighborhood
 
     return ProfileResponse(
         id=str(profile.id),
@@ -42,7 +47,7 @@ def build_profile_response(profile: Profile) -> ProfileResponse:
         years_of_experience=profile.years_of_experience,
         address=profile.address,
         city=profile.city,
-        neighborhood=profile.neighborhood,
+        neighborhood=profile.neighborhood if show_neighborhood else None,
         state=profile.state,
         latitude=profile.latitude,
         longitude=profile.longitude,
@@ -56,6 +61,8 @@ def build_profile_response(profile: Profile) -> ProfileResponse:
         response_time=profile.response_time,
         insurance_backed=profile.insurance_backed,
         phone_visibility=profile.phone_visibility,
+        share_neighborhood=profile.share_neighborhood,
+        is_paused=profile.is_paused,
     )
 
 
@@ -148,7 +155,7 @@ async def list_profiles(
     offset: int = Query(default=0, ge=0),
 ):
     """Public search endpoint to browse verified artisans."""
-    query: dict = {}
+    query: dict = {"is_paused": {"$ne": True}}
     if category:
         query["category"] = category
     if neighborhood:
@@ -196,17 +203,21 @@ async def list_profiles(
         total = result[0]["total"][0]["count"] if result and result[0]["total"] else 0
         profiles = [Profile.model_validate(doc) for doc in raw_docs]
     else:
-        total = await Profile.find(query).count()
-        profiles = (
-            await Profile.find(query)
+        # count() and find() are independent round trips — run them
+        # concurrently instead of back-to-back (same reasoning as the
+        # gather above: each round trip to a remote Atlas cluster is
+        # costly, so halving how many happen serially matters).
+        total, profiles = await asyncio.gather(
+            Profile.find(query).count(),
+            Profile.find(query)
             .sort("-rating_average")
             .skip(offset)
             .limit(limit)
-            .to_list()
+            .to_list(),
         )
 
     return ProfileListResponse(
-        data=[build_profile_response(p) for p in profiles],
+        data=[build_profile_response(p, for_owner=False) for p in profiles],
         meta=ProfileListMeta(
             total=total,
             limit=limit,
@@ -319,21 +330,22 @@ async def get_profile_detail(profile_id: str):
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
 
-    services = await Service.find(
-        {"artisan_profile.$id": profile.id, "is_active": True}
-    ).to_list()
-    portfolio = await PortfolioItem.find({"artisan_profile.$id": profile.id}).to_list()
     artisan_user_id = (
         profile.user.ref.id if hasattr(profile.user, "ref") else profile.user.id
     )
-    reviews = (
-        await Review.find({"artisan.$id": artisan_user_id})
+    # Independent of each other — issued concurrently instead of one round
+    # trip after another, which matters a lot against a remote Atlas
+    # cluster where each round trip alone can cost 100ms+.
+    services, portfolio, reviews = await asyncio.gather(
+        Service.find({"artisan_profile.$id": profile.id, "is_active": True}).to_list(),
+        PortfolioItem.find({"artisan_profile.$id": profile.id}).to_list(),
+        Review.find({"artisan.$id": artisan_user_id})
         .sort("-created_at")
         .limit(20)
-        .to_list()
+        .to_list(),
     )
 
-    base = build_profile_response(profile)
+    base = build_profile_response(profile, for_owner=False)
     return PublicProfileDetailResponse(
         **base.model_dump(),
         services=[build_service_response(s) for s in services],

@@ -143,6 +143,7 @@ class FakeClient:
 
 class FakeRequest:
     client = FakeClient()
+    headers = {}
 
 
 async def test_login_requires_totp_when_2fa_enabled():

@@ -42,6 +42,12 @@ class Profile(Document):
     response_time: Optional[str] = None
     insurance_backed: bool = False
     phone_visibility: str = "after_escrow"  # one of PHONE_VISIBILITY_OPTIONS
+    # Whether the neighborhood field is shown on the public profile/search
+    # results, separate from phone_visibility.
+    share_neighborhood: bool = True
+    # Denormalized from User.is_paused so search can filter with a single
+    # collection query; kept in sync by the freeze-me/unfreeze-me endpoints.
+    is_paused: bool = False
     created_at: datetime = datetime.utcnow()
     updated_at: datetime = datetime.utcnow()
 
@@ -92,6 +98,7 @@ class ProfileUpdate(BaseModel):
     is_available: Optional[bool] = None
     availability_status: Optional[str] = None
     phone_visibility: Optional[str] = None
+    share_neighborhood: Optional[bool] = None
     insurance_backed: Optional[bool] = None
     response_time: Optional[str] = None
 
@@ -124,3 +131,5 @@ class ProfileResponse(BaseModel):
     response_time: Optional[str] = None
     insurance_backed: bool = False
     phone_visibility: str = "after_escrow"
+    share_neighborhood: bool = True
+    is_paused: bool = False

@@ -135,6 +135,8 @@ async def create_fixed_service_booking(
     artisan = await User.get(ObjectId(payload.artisan_id))
     if not artisan or artisan.role != "artisan":
         raise HTTPException(status_code=404, detail="Artisan not found.")
+    if artisan.is_paused:
+        raise HTTPException(status_code=400, detail="This artisan isn't accepting new bookings right now.")
 
     booking = Booking(
         client=current_user,
@@ -180,6 +182,8 @@ async def request_custom_quote(
     artisan = await User.get(ObjectId(payload.artisan_id))
     if not artisan or artisan.role != "artisan":
         raise HTTPException(status_code=404, detail="Artisan not found.")
+    if artisan.is_paused:
+        raise HTTPException(status_code=400, detail="This artisan isn't accepting new bookings right now.")
 
     booking = Booking(
         client=current_user,
@@ -331,6 +335,8 @@ async def buy_gig_item(
     artisan = await User.get(ObjectId(payload.artisan_id))
     if not artisan:
         raise HTTPException(status_code=404, detail="Artisan not found.")
+    if artisan.is_paused:
+        raise HTTPException(status_code=400, detail="This artisan isn't accepting new bookings right now.")
 
     # FIX (security audit): the booking's amount/escrow used to come
     # straight from the client-supplied payload.amount with no cross-check

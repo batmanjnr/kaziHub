@@ -3,6 +3,7 @@ import certifi
 import dns.resolver
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from beanie import init_beanie
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -46,7 +47,16 @@ async def lifespan(app: FastAPI):
     # Initialize Motor client with certifi CA bundle
     client = AsyncIOMotorClient(
         settings.MONGODB_URL,
-        tlsCAFile=certifi.where()
+        tlsCAFile=certifi.where(),
+        # Keep a handful of connections warm so a request right after an
+        # idle period doesn't pay a fresh TLS handshake on top of the
+        # round trip to Atlas; cap the pool so a traffic spike can't open
+        # unbounded connections.
+        minPoolSize=5,
+        maxPoolSize=100,
+        # zlib is a stdlib codec, no extra dependency — trims wire size
+        # for larger query results (lists, profile detail payloads).
+        compressors="zlib",
     )
     database = client[settings.DATABASE_NAME]
 
@@ -105,6 +115,10 @@ app.add_middleware(GlobalRateLimitMiddleware)
 
 # 3c. Baseline security response headers (security-review fix)
 app.add_middleware(SecurityHeadersMiddleware)
+
+# 3d. Compress responses over 1KB — cuts transfer time for list/search
+# endpoints, which are the largest JSON payloads this API returns.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # 4. Include API Router
 app.include_router(api_router, prefix="/api/v1")
