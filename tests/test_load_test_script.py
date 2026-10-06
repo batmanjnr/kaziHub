@@ -18,7 +18,7 @@ async def test_loadtest_script_against_in_memory_app(tmp_path, monkeypatch):
     from app.core.rate_limit import rate_limiter
     orig = rate_limiter.hit
     monkeypatch.setattr(rate_limiter, "hit", lambda key, limit, window_seconds: None if key.startswith("global:") else orig(key, limit, window_seconds))
-    await lt.seed(6)
+    await lt.seed(6, 2)
     real = httpx.AsyncClient
     monkeypatch.setattr(lt.httpx, "AsyncClient", lambda **kw: real(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=30))
     await lt.run("http://test", 4)

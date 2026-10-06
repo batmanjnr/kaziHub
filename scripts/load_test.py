@@ -2,7 +2,7 @@
 log in at the same moment and loop through every endpoint that is safe to
 hit on a live deployment, all at once.
 
-    python -m scripts.load_test seed     --users 50
+    python -m scripts.load_test seed     --clients 100 --artisans 2
     python -m scripts.load_test run      --base-url https://kazihub-52ph.onrender.com --duration 120
     python -m scripts.load_test cleanup
 
@@ -65,7 +65,7 @@ async def _db():
     return client
 
 
-async def seed(n: int) -> None:
+async def seed(n_clients: int, n_artisans: int) -> None:
     from app.models.gig import Gig
     from app.models.profile import Profile
     from app.models.service import Service
@@ -78,8 +78,9 @@ async def seed(n: int) -> None:
 
     hashed = get_password_hash(PASSWORD)
     accounts = []
+    n = n_clients + n_artisans
     for i in range(n):
-        is_artisan = i % 2 == 1
+        is_artisan = i < n_artisans
         user = User(
             first_name="Load", last_name=f"Tester{i}", email=f"loadtest+{i}@example.com",
             phone_number=f"+23480{10000000 + i:08d}", state="Lagos",
@@ -106,14 +107,14 @@ async def seed(n: int) -> None:
             entry.update(profile_id=str(profile.id), service_id=str(service.id))
         accounts.append(entry)
 
-    # Pair each customer with an artisan.
+    # Spread the customers across the artisans, round robin.
     artisans = [a for a in accounts if a["role"] == "artisan"]
     for i, a in enumerate(a for a in accounts if a["role"] == "client"):
         a["partner"] = artisans[i % len(artisans)]
     with open(CREDENTIALS_FILE, "w") as f:
         json.dump(accounts, f, indent=2)
     client.close()
-    print(f"Seeded {n} accounts ({len(artisans)} artisans) into {settings.DATABASE_NAME}; wrote {CREDENTIALS_FILE}.")
+    print(f"Seeded {n} accounts ({n - len(artisans)} customers, {len(artisans)} artisans) into {settings.DATABASE_NAME}; wrote {CREDENTIALS_FILE}.")
 
 
 async def cleanup() -> None:
@@ -172,6 +173,7 @@ class Stats:
         self.latency = defaultdict(list)
         self.status = defaultdict(lambda: defaultdict(int))
         self.samples = defaultdict(dict)
+        self.login_seconds = []
 
     def record(self, name, status, ms, body=None):
         self.latency[name].append(ms)
@@ -202,10 +204,18 @@ class VirtualUser:
         return None
 
     async def login(self):
-        data = await self.call("POST /auth/login", "POST", "/api/v1/auth/login",
-                               data={"username": self.account["email"], "password": PASSWORD})
+        """Up to 3 attempts, like a person pressing Sign in again. Records
+        the total time until this user is actually in."""
+        t = time.perf_counter()
+        data = None
+        for _ in range(3):
+            data = await self.call("POST /auth/login", "POST", "/api/v1/auth/login", timeout=120,
+                                   data={"username": self.account["email"], "password": PASSWORD})
+            if data:
+                break
         if not data:
-            raise RuntimeError(f"login failed for {self.account['email']}")
+            raise RuntimeError(f"login failed after 3 tries for {self.account['email']}")
+        self.stats.login_seconds.append(time.perf_counter() - t)
         self.headers = {"Authorization": f"Bearer {data['access_token']}"}
         self.refresh_token = data["refresh_token"]
 
@@ -275,18 +285,20 @@ class VirtualUser:
         await self.call("GET /profiles/me/portfolio/", "GET", f"{v1}/profiles/me/portfolio/")
         await self.call("GET /gigs/my-gigs", "GET", f"{v1}/gigs/my-gigs")
         requested = await self.call("GET /bookings/me?status", "GET", f"{v1}/bookings/me?status=quote_requested") or []
-        for b in requested[:2]:
+        for b in requested[:10]:
             await self.call("POST /bookings/{id}/quote", "POST", f"{v1}/bookings/{b['id']}/quote",
                             json={"amount": 15000, "breakdown": "Labour"}, expect=(200, 400, 409))
         pending = await self.call("GET /bookings/me?status", "GET", f"{v1}/bookings/me?status=pending") or []
-        for i, b in enumerate(pending[:2]):
+        for i, b in enumerate(pending[:10]):
             action = "accept" if i % 2 == 0 else "decline"
             await self.call(f"POST /bookings/{{id}}/{action}", "POST", f"{v1}/bookings/{b['id']}/{action}",
                             expect=(200, 400, 409))
         convs = await self.call("GET /conversations", "GET", f"{v1}/conversations") or []
-        if convs:
+        for conv in convs[:5]:
+            await self.call("GET /conversations/{id}/messages", "GET", f"{v1}/conversations/{conv['id']}/messages")
             await self.call("POST /conversations/{id}/messages", "POST",
-                            f"{v1}/conversations/{convs[0]['id']}/messages", json={"content": "On my way"})
+                            f"{v1}/conversations/{conv['id']}/messages", json={"content": "On my way"})
+            await self.call("PATCH /conversations/{id}/read", "PATCH", f"{v1}/conversations/{conv['id']}/read")
         if round_no == 0:
             await self.call("GET /payments/banks", "GET", f"{v1}/payments/banks")
             await self.call("GET /auth/me/export", "GET", f"{v1}/auth/me/export")
@@ -336,6 +348,10 @@ async def run(base_url: str, duration: int) -> None:
         elapsed = time.monotonic() - began
 
     failures = [r for r in results if isinstance(r, Exception)]
+    if stats.login_seconds:
+        ls = stats.login_seconds
+        print(f"\nTime until logged in: {len(ls)}/{len(users)} users got in; "
+              f"p50 {pct(ls, 50):.1f}s, p95 {pct(ls, 95):.1f}s, slowest {max(ls):.1f}s")
     rounds = sum(r for r in results if isinstance(r, int))
     total = sum(len(v) for v in stats.latency.values())
     errors = sum(c for s in stats.status.values() for code, c in s.items() if code >= 400)
@@ -374,12 +390,13 @@ async def run(base_url: str, duration: int) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["seed", "run", "cleanup"])
-    parser.add_argument("--users", type=int, default=50)
+    parser.add_argument("--clients", type=int, default=100)
+    parser.add_argument("--artisans", type=int, default=2)
     parser.add_argument("--base-url", default="https://kazihub-52ph.onrender.com")
     parser.add_argument("--duration", type=int, default=120, help="seconds of sustained traffic")
     args = parser.parse_args()
     if args.command == "seed":
-        asyncio.run(seed(args.users))
+        asyncio.run(seed(args.clients, args.artisans))
     elif args.command == "run":
         asyncio.run(run(args.base_url, args.duration))
     else:

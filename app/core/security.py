@@ -1,4 +1,5 @@
 # app/core/security.py
+import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -65,3 +66,15 @@ def hash_refresh_token(token: str) -> str:
     """Refresh tokens are stored hashed (spec §3) so a DB read alone can't
     be replayed as a live session."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+# bcrypt is deliberately slow CPU work (~0.25s per call on one fast core,
+# several seconds on a small shared host). Called directly inside an async
+# endpoint it blocks the event loop, freezing every other request until it
+# finishes: under a burst of logins the whole API stalls (load test,
+# 2026-10-06). Endpoints use these wrappers, which run it in a worker thread.
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    return await asyncio.to_thread(verify_password, plain_password, hashed_password)
+
+
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(get_password_hash, password)

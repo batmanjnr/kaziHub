@@ -29,9 +29,9 @@ from app.services.moderation import moderate_image
 from app.core.security import (
     create_access_token,
     generate_refresh_token,
-    get_password_hash,
+    hash_password_async,
     hash_refresh_token,
-    verify_password,
+    verify_password_async,
 )
 from app.models.pending_user import PendingUser
 from app.models.profile import Profile
@@ -221,7 +221,7 @@ async def register(request: Request, user_in: UserCreate, background_tasks: Back
         pending_user.nin_hash = nin_hash
         pending_user.state = user_in.state
         pending_user.role = user_in.role.lower()
-        pending_user.hashed_password = get_password_hash(user_in.password)
+        pending_user.hashed_password = await hash_password_async(user_in.password)
         pending_user.otp_code = otp
         pending_user.otp_expires_at = otp_expiry
         pending_user.otp_attempts = 0
@@ -239,7 +239,7 @@ async def register(request: Request, user_in: UserCreate, background_tasks: Back
             nin_hash=nin_hash,
             state=user_in.state,
             role=user_in.role.lower(),
-            hashed_password=get_password_hash(user_in.password),
+            hashed_password=await hash_password_async(user_in.password),
             otp_code=otp,
             otp_expires_at=otp_expiry,
             terms_version=user_in.terms_version,
@@ -413,7 +413,7 @@ async def login(
     rate_limiter.hit(f"login:{ip}:{form_data.username}", limit=5, window_seconds=900)
 
     user = await User.find_one(User.email == form_data.username)
-    if not user or not verify_password(form_data.password, user.hashed_password):
+    if not user or not await verify_password_async(form_data.password, user.hashed_password):
         raise APIError(
             status.HTTP_401_UNAUTHORIZED,
             "Incorrect email or password",
@@ -598,7 +598,7 @@ async def reset_password(payload: ResetPasswordSchema):
         )
 
     # Hash new password and clear reset fields
-    user.hashed_password = get_password_hash(payload.new_password)
+    user.hashed_password = await hash_password_async(payload.new_password)
     user.reset_otp_code = None
     user.reset_otp_expires_at = None
     user.reset_otp_attempts = 0
@@ -784,7 +784,7 @@ async def disable_two_factor(
     authenticator can still get back in and turn it off."""
     if not current_user.two_factor_enabled:
         raise APIError(status.HTTP_409_CONFLICT, "Two-factor authentication is already off.", code="totp_not_enabled")
-    if not verify_password(payload.current_password, current_user.hashed_password):
+    if not await verify_password_async(payload.current_password, current_user.hashed_password):
         raise APIError(status.HTTP_400_BAD_REQUEST, "Current password is incorrect.", code="invalid_password")
     if not await verify_totp_or_backup_code(current_user, payload.totp_code.strip()):
         raise APIError(status.HTTP_400_BAD_REQUEST, "That 2FA code is wrong or has expired.", code="totp_invalid")
@@ -826,11 +826,11 @@ async def change_password(
 ):
     """Change the password for an already-authenticated user (current +
     new password), distinct from the forgot/reset-password OTP flow."""
-    if not verify_password(payload.current_password, current_user.hashed_password):
+    if not await verify_password_async(payload.current_password, current_user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect."
         )
-    current_user.hashed_password = get_password_hash(payload.new_password)
+    current_user.hashed_password = await hash_password_async(payload.new_password)
     # Same rationale as reset-password: a password change invalidates any
     # other live sessions in case the old password had leaked.
     current_user.token_version += 1
@@ -953,7 +953,7 @@ async def request_email_change(
     """Start an email change: verifies the current password, then sends an
     OTP to the NEW address. The email only actually changes once that OTP
     is confirmed via /change-email/confirm, proving the user controls it."""
-    if not verify_password(payload.current_password, current_user.hashed_password):
+    if not await verify_password_async(payload.current_password, current_user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect."
         )
