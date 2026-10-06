@@ -4,10 +4,13 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
 
 from app.api.deps import get_current_user
+from app.core.cloudinary import delete_file_from_cloudinary, upload_file_to_cloudinary
 from app.core.idempotency import cache_response, get_cached_response, require_idempotency_key
+from app.core.time import utc_now
+from app.core.upload_validation import IMAGE_TYPES, validate_upload
 from app.core.websocket_manager import manager
 from app.models.booking import (
     Booking,
@@ -21,16 +24,23 @@ from app.models.booking import (
     FixedBookingCreate,
     GigPurchaseCreate,
     SendQuoteSchema,
+    SubmitCompletionSchema,
 )
 from app.models.booking_status_history import BookingStatusHistory
 from app.models.chat import Conversation, Message
 from app.models.dispute import Dispute, DisputeCreate, DisputeResponse
 from app.models.gig import Gig
 from app.models.profile import Profile
+from app.models.service import Service
 from app.models.transaction import Transaction, TransactionStatus, TransactionType
+from app.models.uploads import UploadUrlResponse
 from app.models.user import User
-from app.services.payouts import request_artisan_payout
+from app.models.verification import Verification, VerificationStatus
 from app.services.booking_transitions import apply_booking_transition
+from app.services.moderation import moderate_image
+from app.services.notifications import naira, notify_booking_party
+from app.services.paystack import PaystackError, verify_transaction
+from app.services.payouts import release_escrow_with_payout
 
 router = APIRouter()
 
@@ -52,13 +62,48 @@ def compute_escrow_breakdown(amount: float, commission_rate: float = DEFAULT_COM
     }
 
 
-def build_booking_response(b: Booking) -> BookingResponse:
-    client_id = str(b.client.ref.id if hasattr(b.client, "ref") else b.client.id)
-    artisan_id = str(b.artisan.ref.id if hasattr(b.artisan, "ref") else b.artisan.id)
+# Statuses in which the client's money is (or was) in escrow — the point
+# from which phone numbers may be shared under "after_escrow".
+PAID_STATUSES = (
+    BookingStatus.ESCROW_FUNDED,
+    BookingStatus.IN_PROGRESS,
+    BookingStatus.COMPLETED_BY_ARTISAN,
+    BookingStatus.PAID_OUT,
+    BookingStatus.DISPUTED,
+)
+
+
+def _link_id(link):
+    return link.ref.id if hasattr(link, "ref") else link.id
+
+
+def _full_name(user: Optional[User]) -> Optional[str]:
+    return f"{user.first_name} {user.last_name}".strip() if user else None
+
+
+def _phone_shared(rule: str, booking: Booking, viewer_is_verified: bool) -> bool:
+    """phone_visibility (ask 11): after_escrow = once the booking is paid
+    into escrow; verified_only = the same, and only to an ID-verified
+    viewer; hidden = never."""
+    if rule == "hidden" or booking.status not in PAID_STATUSES:
+        return False
+    if rule == "verified_only":
+        return viewer_is_verified
+    return True
+
+
+def build_booking_response(
+    b: Booking,
+    client: Optional[User] = None,
+    artisan: Optional[User] = None,
+    profile: Optional[Profile] = None,
+    client_phone: Optional[str] = None,
+    artisan_phone: Optional[str] = None,
+) -> BookingResponse:
     return BookingResponse(
         id=str(b.id),
-        client_id=client_id,
-        artisan_id=artisan_id,
+        client_id=str(_link_id(b.client)),
+        artisan_id=str(_link_id(b.artisan)),
         gig_id=b.gig_id,
         booking_type=b.booking_type,
         title=b.title,
@@ -78,12 +123,67 @@ def build_booking_response(b: Booking) -> BookingResponse:
         artisan_earnings=b.artisan_earnings,
         platform_commission_rate=b.platform_commission_rate,
         scheduled_date=b.scheduled_date,
+        scheduled_window=b.scheduled_time_slot,
         completion_description=b.completion_description,
         completion_photos=b.completion_photos,
         auto_completion_deadline=b.auto_completion_deadline,
         lock_version=b.lock_version,
         created_at=b.created_at,
+        client_name=_full_name(client),
+        client_avatar=client.profile_picture if client else None,
+        client_phone=client_phone,
+        artisan_name=_full_name(artisan),
+        artisan_avatar=artisan.profile_picture if artisan else None,
+        artisan_phone=artisan_phone,
+        artisan_profile_id=str(profile.id) if profile else None,
+        artisan_category=(profile.category or None) if profile else None,
     )
+
+
+async def booking_responses(bookings: List[Booking], viewer: Optional[User]) -> List[BookingResponse]:
+    """Bookings with both people's names, avatars and (where their
+    phone_visibility allows) phone numbers, in a fixed number of queries
+    however many bookings there are (ask 29)."""
+    if not bookings:
+        return []
+    user_ids = {_link_id(b.client) for b in bookings} | {_link_id(b.artisan) for b in bookings}
+    users = {u.id: u for u in await User.find({"_id": {"$in": list(user_ids)}}).to_list()}
+    artisan_ids = list({_link_id(b.artisan) for b in bookings})
+    profiles = {
+        _link_id(p.user): p
+        for p in await Profile.find({"user.$id": {"$in": artisan_ids}}).to_list()
+    }
+
+    viewer_kyc_verified = False
+    if viewer is not None:
+        viewer_kyc_verified = bool(
+            await Verification.find_one(
+                {"user.$id": viewer.id, "status": VerificationStatus.APPROVED.value}
+            )
+        )
+
+    out = []
+    for b in bookings:
+        client = users.get(_link_id(b.client))
+        artisan = users.get(_link_id(b.artisan))
+        profile = profiles.get(_link_id(b.artisan))
+        client_phone = artisan_phone = None
+        if viewer is not None and client and artisan:
+            if viewer.id == artisan.id:
+                # verified_only for a customer's number = the artisan is verified.
+                artisan_verified = bool(profile and profile.is_verified)
+                if _phone_shared(client.phone_visibility, b, artisan_verified):
+                    client_phone = client.phone_number
+            elif viewer.id == client.id:
+                rule = profile.phone_visibility if profile else "after_escrow"
+                if _phone_shared(rule, b, viewer_kyc_verified):
+                    artisan_phone = artisan.phone_number
+        out.append(build_booking_response(b, client, artisan, profile, client_phone, artisan_phone))
+    return out
+
+
+async def booking_response(booking: Booking, viewer: Optional[User]) -> BookingResponse:
+    return (await booking_responses([booking], viewer))[0]
 
 
 async def get_or_create_conversation(client: User, artisan: User, booking: Booking) -> Conversation:
@@ -98,6 +198,7 @@ async def get_or_create_conversation(client: User, artisan: User, booking: Booki
     conv.active_booking_id = str(booking.id)
     conv.active_job_title = booking.title
     conv.active_job_amount = booking.amount
+    conv.hidden_for = []
     await conv.save()
     return conv
 
@@ -119,6 +220,29 @@ def _participant_ids(booking: Booking) -> tuple:
 
 
 # ---------------------------------------------------------
+# BOOKING PHOTOS (ask 27)
+# ---------------------------------------------------------
+@router.post("/upload", response_model=UploadUrlResponse)
+async def upload_booking_photo(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload one photo for a booking: the problem when booking
+    (`attachments`), proof of work (`completion_photos`), dispute evidence
+    (`evidence_photos`) or a review photo. Multipart, one `file` field:
+    JPEG, PNG or WebP, up to 10 MB. Returns {"url": ...}."""
+    await validate_upload(file, allowed_types=IMAGE_TYPES)
+    secure_url = await upload_file_to_cloudinary(file, folder="kazihub/bookings")
+    if not await moderate_image(secure_url):
+        await delete_file_from_cloudinary(secure_url)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This image did not pass content moderation.",
+        )
+    return {"url": secure_url}
+
+
+# ---------------------------------------------------------
 # 1. FIXED-PRICE SERVICE BOOKING
 # ---------------------------------------------------------
 @router.post("/fixed", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
@@ -127,42 +251,80 @@ async def create_fixed_service_booking(
     current_user: User = Depends(get_current_user),
     idempotency_key: str = Depends(require_idempotency_key),
 ):
-    """Client creates fixed-price booking. Requires Idempotency-Key."""
+    """Client books one of an artisan's fixed-price services. Requires
+    Idempotency-Key.
+
+    The title and price always come from `service_id` (ask 24); any
+    `service_title`/`amount` sent is ignored. The service must be active,
+    belong to this artisan, and have pricing_type "fixed" — book
+    "starting" and quote-only services through /quote-request instead.
+    """
     cached = await get_cached_response(idempotency_key, current_user, "bookings.create_fixed")
     if cached:
         return cached
 
-    artisan = await User.get(ObjectId(payload.artisan_id))
-    if not artisan or artisan.role != "artisan":
-        raise HTTPException(status_code=404, detail="Artisan not found.")
-    if artisan.is_paused:
-        raise HTTPException(status_code=400, detail="This artisan isn't accepting new bookings right now.")
+    artisan = await _load_bookable_artisan(payload.artisan_id, current_user)
+
+    try:
+        service = await Service.get(ObjectId(payload.service_id))
+    except Exception:
+        service = None
+    if not service or not service.is_active:
+        raise HTTPException(status_code=404, detail="Service not found or no longer offered.")
+    service_profile = await Profile.get(_link_id(service.artisan_profile))
+    if not service_profile or _link_id(service_profile.user) != artisan.id:
+        raise HTTPException(status_code=400, detail="This service doesn't belong to the specified artisan.")
+    if service.pricing_type != "fixed" or service.price <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Only fixed-price services can be booked directly. Request a quote for this one.",
+        )
 
     booking = Booking(
         client=current_user,
         artisan=artisan,
         booking_type=BookingType.FIXED_SERVICE,
-        title=payload.service_title,
-        amount=payload.amount,
+        title=service.name,
+        amount=service.price,
         description=payload.description,
         address=payload.address,
         landmark_hint=payload.landmark_hint,
         attachments=payload.attachments,
+        scheduled_date=payload.scheduled_date,
+        scheduled_time_slot=payload.scheduled_window,
         status=BookingStatus.PENDING,
         reference_code=generate_reference_code(),
-        **compute_escrow_breakdown(payload.amount),
+        **compute_escrow_breakdown(service.price),
     )
     await booking.insert()
     await BookingStatusHistory(
         booking=booking, from_status=None, to_status=booking.status.value, changed_by=current_user
     ).insert()
     await get_or_create_conversation(current_user, artisan, booking)
+    await notify_booking_party(
+        booking, "artisan", "booking_requested", "New booking",
+        f"{current_user.first_name} booked '{booking.title}' for {naira(booking.amount)}.",
+    )
 
-    response = build_booking_response(booking)
+    response = await booking_response(booking, current_user)
     await cache_response(
         idempotency_key, current_user, "bookings.create_fixed", response.model_dump(mode="json"), 201
     )
     return response
+
+
+async def _load_bookable_artisan(artisan_id: str, client: User) -> User:
+    try:
+        artisan = await User.get(ObjectId(artisan_id))
+    except Exception:
+        artisan = None
+    if not artisan or artisan.role != "artisan" or artisan.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Artisan not found.")
+    if artisan.id == client.id:
+        raise HTTPException(status_code=400, detail="You can't book yourself.")
+    if artisan.is_paused or not artisan.is_active or artisan.is_frozen:
+        raise HTTPException(status_code=400, detail="This artisan isn't accepting new bookings right now.")
+    return artisan
 
 
 # ---------------------------------------------------------
@@ -179,11 +341,7 @@ async def request_custom_quote(
     if cached:
         return cached
 
-    artisan = await User.get(ObjectId(payload.artisan_id))
-    if not artisan or artisan.role != "artisan":
-        raise HTTPException(status_code=404, detail="Artisan not found.")
-    if artisan.is_paused:
-        raise HTTPException(status_code=400, detail="This artisan isn't accepting new bookings right now.")
+    artisan = await _load_bookable_artisan(payload.artisan_id, current_user)
 
     booking = Booking(
         client=current_user,
@@ -195,6 +353,8 @@ async def request_custom_quote(
         address=payload.address,
         landmark_hint=payload.landmark_hint,
         attachments=payload.attachments,
+        scheduled_date=payload.scheduled_date,
+        scheduled_time_slot=payload.scheduled_window,
         status=BookingStatus.QUOTE_REQUESTED,
         reference_code=generate_reference_code(),
     )
@@ -217,8 +377,12 @@ async def request_custom_quote(
         "booking_id": str(booking.id),
         "status": booking.status,
     })
+    await notify_booking_party(
+        booking, "artisan", "booking_requested", "New quote request",
+        f"{current_user.first_name} asked for a quote for '{booking.title}'.",
+    )
 
-    response = build_booking_response(booking)
+    response = await booking_response(booking, current_user)
     await cache_response(
         idempotency_key, current_user, "bookings.quote_request", response.model_dump(mode="json"), 201
     )
@@ -283,7 +447,11 @@ async def send_custom_quote(
             }
         })
 
-    return build_booking_response(booking)
+    await notify_booking_party(
+        booking, "client", "quote_sent", "Quote received",
+        f"You received a quote of {naira(payload.amount)} for '{booking.title}'.",
+    )
+    return await booking_response(booking, current_user)
 
 
 @router.post("/{booking_id}/quote/accept", response_model=BookingResponse)
@@ -315,7 +483,11 @@ async def accept_custom_quote(
             "status": booking.status,
         })
 
-    return build_booking_response(booking)
+    await notify_booking_party(
+        booking, "artisan", "quote_accepted", "Quote accepted",
+        f"{current_user.first_name} accepted your quote for '{booking.title}'. Waiting for payment.",
+    )
+    return await booking_response(booking, current_user)
 
 
 # ---------------------------------------------------------
@@ -332,11 +504,7 @@ async def buy_gig_item(
     if cached:
         return cached
 
-    artisan = await User.get(ObjectId(payload.artisan_id))
-    if not artisan:
-        raise HTTPException(status_code=404, detail="Artisan not found.")
-    if artisan.is_paused:
-        raise HTTPException(status_code=400, detail="This artisan isn't accepting new bookings right now.")
+    artisan = await _load_bookable_artisan(payload.artisan_id, current_user)
 
     # FIX (security audit): the booking's amount/escrow used to come
     # straight from the client-supplied payload.amount with no cross-check
@@ -376,13 +544,17 @@ async def buy_gig_item(
         booking=booking, from_status=None, to_status=booking.status.value, changed_by=current_user
     ).insert()
     await get_or_create_conversation(current_user, artisan, booking)
+    await notify_booking_party(
+        booking, "artisan", "booking_requested", "New gig order",
+        f"{current_user.first_name} ordered '{booking.title}' for {naira(booking.amount)}.",
+    )
 
     # NOTE (security audit): gig.orders_count is incremented when escrow is
     # actually funded (wallet.py's _handle_charge_success), not here —
     # incrementing it at mere booking creation let anyone manufacture fake
     # "sold" counts for a gig without ever paying.
 
-    response = build_booking_response(booking)
+    response = await booking_response(booking, current_user)
     await cache_response(
         idempotency_key, current_user, "bookings.buy_gig", response.model_dump(mode="json"), 201
     )
@@ -406,7 +578,11 @@ async def accept_booking(booking_id: str, current_user: User = Depends(get_curre
         to_status=BookingStatus.ACCEPTED,
         changed_by=current_user,
     )
-    return build_booking_response(booking)
+    await notify_booking_party(
+        booking, "client", "booking_accepted", "Booking accepted",
+        f"Your booking '{booking.title}' was accepted. Pay into escrow to get it started.",
+    )
+    return await booking_response(booking, current_user)
 
 
 @router.post("/{booking_id}/decline", response_model=BookingResponse)
@@ -425,7 +601,11 @@ async def decline_booking(booking_id: str, current_user: User = Depends(get_curr
         changed_by=current_user,
         reason="Declined by artisan",
     )
-    return build_booking_response(booking)
+    await notify_booking_party(
+        booking, "client", "booking_declined", "Booking declined",
+        f"Your booking '{booking.title}' was declined by the artisan.",
+    )
+    return await booking_response(booking, current_user)
 
 
 # ---------------------------------------------------------
@@ -437,9 +617,11 @@ async def confirm_fund_escrow(
     current_user: User = Depends(get_current_user),
     idempotency_key: str = Depends(require_idempotency_key),
 ):
-    """Confirms escrow payment after the Paystack gateway callback, in
-    addition to the webhook (spec §10) — covers the case where the webhook
-    is delayed relative to the client's redirect back into the app.
+    """Call from the page Paystack redirects to after checkout (ask 25).
+
+    Confirms the payment and moves the booking to escrow_funded. If the
+    Paystack webhook hasn't arrived yet, this asks Paystack directly, so the
+    page doesn't have to wait for it. Safe to call more than once.
     """
     cached = await get_cached_response(idempotency_key, current_user, "bookings.fund_escrow")
     if cached:
@@ -455,6 +637,8 @@ async def confirm_fund_escrow(
         "type": TransactionType.ESCROW_DEPOSIT.value,
         "status": TransactionStatus.SUCCESSFUL.value,
     })
+    if not tx:
+        tx = await _verify_pending_deposit_with_paystack(booking)
     if not tx:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -484,12 +668,47 @@ async def confirm_fund_escrow(
             "booking_id": str(booking.id),
             "status": booking.status,
         })
+    await notify_escrow_funded(booking)
 
-    response = build_booking_response(booking)
+    response = await booking_response(booking, current_user)
     await cache_response(
         idempotency_key, current_user, "bookings.fund_escrow", response.model_dump(mode="json"), 200
     )
     return response
+
+
+async def notify_escrow_funded(booking: Booking) -> None:
+    await notify_booking_party(
+        booking, "artisan", "escrow_funded", "Payment secured",
+        f"{naira(booking.escrow_amount or booking.amount)} for '{booking.title}' is held in escrow. You can start the job.",
+    )
+
+
+async def _verify_pending_deposit_with_paystack(booking: Booking) -> Optional[Transaction]:
+    """Webhook fallback: ask Paystack about this booking's most recent
+    pending deposit. Marks it successful only if Paystack says it succeeded
+    for at least the expected amount."""
+    pending = (
+        await Transaction.find({
+            "booking.$id": booking.id,
+            "type": TransactionType.ESCROW_DEPOSIT.value,
+            "status": TransactionStatus.PENDING.value,
+        }).sort("-created_at").limit(1).to_list()
+    )
+    if not pending:
+        return None
+    tx = pending[0]
+    try:
+        data = await verify_transaction(tx.transaction_reference)
+    except PaystackError:
+        return None
+    paid_kobo = int(data.get("amount") or 0)
+    if data.get("status") != "success" or paid_kobo < int(round(tx.amount * 100)):
+        return None
+    tx.status = TransactionStatus.SUCCESSFUL
+    tx.gateway_response = data
+    await tx.save()
+    return tx
 
 
 # ---------------------------------------------------------
@@ -511,7 +730,7 @@ async def get_my_bookings(
     bookings = (
         await Booking.find(query).sort("-created_at").skip(offset).limit(limit).to_list()
     )
-    return [build_booking_response(b) for b in bookings]
+    return await booking_responses(bookings, current_user)
 
 
 @router.get("/{booking_id}", response_model=BookingDetailResponse)
@@ -539,35 +758,83 @@ async def get_booking_detail(booking_id: str, current_user: User = Depends(get_c
         for h in history
     ]
 
-    base = build_booking_response(booking)
+    base = await booking_response(booking, current_user)
     return BookingDetailResponse(**base.model_dump(), timeline=timeline)
 
 
-@router.post("/{booking_id}/submit-completion", response_model=BookingResponse)
-async def submit_completion(
-    booking_id: str,
-    current_user: User = Depends(get_current_user),
-):
-    """Artisan submits proof of completion, starting the 4-day auto-release
-    window (spec §6/§7)."""
+@router.post("/{booking_id}/start", response_model=BookingResponse)
+async def start_job(booking_id: str, current_user: User = Depends(get_current_user)):
+    """Artisan starts a paid job: escrow_funded -> in_progress (ask 30)."""
     booking = await _load_booking_or_404(booking_id)
     _, artisan_id = _participant_ids(booking)
     if artisan_id != str(current_user.id):
         raise HTTPException(status_code=403, detail="Not authorized.")
 
-    now = datetime.now(timezone.utc)
     booking = await apply_booking_transition(
         booking.id,
-        allowed_statuses=[BookingStatus.IN_PROGRESS],
+        allowed_statuses=[BookingStatus.ESCROW_FUNDED],
+        allowed_escrow_statuses=[EscrowStatus.HELD_IN_ESCROW],
+        to_status=BookingStatus.IN_PROGRESS,
+        changed_by=current_user,
+    )
+    await notify_booking_party(
+        booking, "client", "job_started", "Job started",
+        f"The artisan has started '{booking.title}'.",
+    )
+    return await booking_response(booking, current_user)
+
+
+@router.post("/{booking_id}/submit-completion", response_model=BookingResponse)
+async def submit_completion(
+    booking_id: str,
+    payload: Optional[SubmitCompletionSchema] = Body(default=None),
+    current_user: User = Depends(get_current_user),
+):
+    """Artisan marks the job done, optionally with notes and photos as
+    proof (ask 28; photo URLs from POST /bookings/upload). Starts the 4-day
+    window after which payment is released automatically unless the client
+    confirms or disputes first. Allowed from in_progress, or straight from
+    escrow_funded for jobs that never needed a separate start."""
+    booking = await _load_booking_or_404(booking_id)
+    _, artisan_id = _participant_ids(booking)
+    if artisan_id != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized.")
+
+    payload = payload or SubmitCompletionSchema()
+    now = utc_now()
+    deadline = now + AUTO_RELEASE_WINDOW
+    booking = await apply_booking_transition(
+        booking.id,
+        allowed_statuses=[BookingStatus.IN_PROGRESS, BookingStatus.ESCROW_FUNDED],
         allowed_escrow_statuses=[EscrowStatus.HELD_IN_ESCROW],
         updates={
             "completion_submitted_at": now,
-            "auto_completion_deadline": now + AUTO_RELEASE_WINDOW,
+            "auto_completion_deadline": deadline,
+            "completion_description": payload.completion_description,
+            "completion_photos": payload.completion_photos,
         },
         to_status=BookingStatus.COMPLETED_BY_ARTISAN,
         changed_by=current_user,
     )
-    return build_booking_response(booking)
+    await notify_completion_submitted(booking)
+    return await booking_response(booking, current_user)
+
+
+async def notify_completion_submitted(booking: Booking) -> None:
+    deadline = booking.auto_completion_deadline
+    when = deadline.strftime("%d %b %Y, %H:%M UTC") if deadline else "in 4 days"
+    await notify_booking_party(
+        booking, "client", "completion_submitted", "Job marked as done",
+        f"The artisan marked '{booking.title}' as done. Confirm it or open a dispute before {when}, "
+        "otherwise payment is released automatically.",
+    )
+
+
+async def notify_payment_released(booking: Booking) -> None:
+    await notify_booking_party(
+        booking, "artisan", "payment_released", "Payment released",
+        f"{naira(booking.artisan_earnings or booking.amount)} for '{booking.title}' is on its way to your bank account.",
+    )
 
 
 async def core_confirm_completion(booking: Booking, current_user: User) -> Booking:
@@ -575,38 +842,16 @@ async def core_confirm_completion(booking: Booking, current_user: User) -> Booki
     wallet.py's legacy /release-escrow alias, so there's exactly one place
     that moves a booking's escrow to released_to_artisan.
 
-    Triggers a real Paystack Transfer to the artisan's verified bank account
-    (spec §11.4) before touching the booking at all — if Paystack won't even
-    accept the transfer request (e.g. no verified bank account on file), we
-    fail loudly here rather than marking the booking paid out with no money
-    behind it. The transfer's *final* settlement is confirmed later by the
-    transfer.success/failed/reversed webhook (wallet.py), which is why the
-    ledger entry below is recorded as PENDING, not SUCCESSFUL.
+    The booking is claimed (atomically moved to paid_out) *before* the
+    Paystack Transfer is sent (spec §11.4), so a concurrent release can
+    never trigger a second transfer — see app.services.payouts. The
+    transfer's final settlement is confirmed later by the
+    transfer.success/failed/reversed webhook (wallet.py).
     """
-    artisan_id = booking.artisan.ref.id if hasattr(booking.artisan, "ref") else booking.artisan.id
-    payout_amount = booking.artisan_earnings or booking.amount
-    payout_result = await request_artisan_payout(
-        artisan_id,
-        payout_amount,
-        reason=f"KaziHub booking {booking.reference_code or booking.id} payout",
-    )
-    if payout_result["status"] != "pending":
-        error = payout_result["gateway_response"].get("error", "Payout could not be initiated.")
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"Payout failed: {error}")
-
-    async def _release_escrow_writes(booking: Booking, session) -> None:
-        tx = Transaction(
-            booking=booking,
-            transaction_reference=payout_result["reference"],
-            amount=payout_amount,
-            type=TransactionType.ESCROW_RELEASE,
-            status=TransactionStatus.PENDING,
-            gateway_response=payout_result["gateway_response"],
-        )
-        await tx.insert(session=session)
-
-    booking = await apply_booking_transition(
-        booking.id,
+    booking = await release_escrow_with_payout(
+        booking,
+        payout_amount=booking.artisan_earnings or booking.amount,
+        payout_reason=f"KaziHub booking {booking.reference_code or booking.id} payout",
         allowed_statuses=[BookingStatus.COMPLETED_BY_ARTISAN],
         allowed_escrow_statuses=[EscrowStatus.HELD_IN_ESCROW],
         updates={
@@ -615,7 +860,6 @@ async def core_confirm_completion(booking: Booking, current_user: User) -> Booki
         },
         to_status=BookingStatus.PAID_OUT,
         changed_by=current_user,
-        extra_writes=_release_escrow_writes,
     )
 
     try:
@@ -625,6 +869,8 @@ async def core_confirm_completion(booking: Booking, current_user: User) -> Booki
             await profile.save()
     except Exception:
         pass
+
+    await notify_payment_released(booking)
 
     conv = await Conversation.find_one({
         "client.$id": booking.client.ref.id,
@@ -660,7 +906,7 @@ async def confirm_completion(
 
     booking = await core_confirm_completion(booking, current_user)
 
-    response = build_booking_response(booking)
+    response = await booking_response(booking, current_user)
     await cache_response(
         idempotency_key, current_user, "bookings.confirm_completion", response.model_dump(mode="json"), 200
     )
@@ -712,6 +958,10 @@ async def dispute_booking(
     )
 
     dispute = await Dispute.find_one({"booking.$id": booking.id})
+    await notify_booking_party(
+        booking, "artisan", "booking_disputed", "Dispute opened",
+        f"The client opened a dispute on '{booking.title}' ({dispute.ticket_id}). Our team will be in touch.",
+    )
 
     response = DisputeResponse(
         id=str(dispute.id),
@@ -788,6 +1038,11 @@ async def cancel_booking(
         changed_by=current_user,
         extra_writes=_cancel_refund_writes,
     )
+    await notify_booking_party(
+        booking, "artisan" if str(current_user.id) == c_id else "client",
+        "booking_cancelled", "Booking cancelled",
+        f"'{booking.title}' was cancelled by the {'client' if str(current_user.id) == c_id else 'artisan'}.",
+    )
 
     conv = await Conversation.find_one({
         "client.$id": booking.client.ref.id,
@@ -800,7 +1055,7 @@ async def cancel_booking(
             "status": booking.status,
         })
 
-    return build_booking_response(booking)
+    return await booking_response(booking, current_user)
 
 
 @router.patch("/{booking_id}/status", response_model=BookingResponse)
@@ -826,8 +1081,11 @@ async def update_booking_status(
             to_status=BookingStatus.IN_PROGRESS,
             changed_by=current_user,
         )
+        await notify_booking_party(
+            booking, "client", "job_started", "Job started", f"The artisan has started '{booking.title}'."
+        )
     elif status_update == BookingStatus.COMPLETED_BY_ARTISAN and u_id == a_id:
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         booking = await apply_booking_transition(
             booking.id,
             allowed_statuses=[BookingStatus.IN_PROGRESS],
@@ -838,6 +1096,7 @@ async def update_booking_status(
             to_status=BookingStatus.COMPLETED_BY_ARTISAN,
             changed_by=current_user,
         )
+        await notify_completion_submitted(booking)
     elif status_update == BookingStatus.CANCELLED:
         if booking.status in (
             BookingStatus.PAID_OUT,
@@ -850,6 +1109,10 @@ async def update_booking_status(
             )
         booking = await apply_booking_transition(
             booking.id, to_status=BookingStatus.CANCELLED, changed_by=current_user
+        )
+        await notify_booking_party(
+            booking, "artisan" if u_id == c_id else "client", "booking_cancelled", "Booking cancelled",
+            f"'{booking.title}' was cancelled by the {'client' if u_id == c_id else 'artisan'}.",
         )
     else:
         raise HTTPException(status_code=400, detail="Unsupported or unauthorized status transition.")
@@ -865,4 +1128,4 @@ async def update_booking_status(
             "status": booking.status,
         })
 
-    return build_booking_response(booking)
+    return await booking_response(booking, current_user)

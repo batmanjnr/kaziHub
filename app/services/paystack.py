@@ -56,14 +56,29 @@ async def _request(method: str, path: str, **kwargs) -> dict:
 
 
 async def initialize_transaction(
-    email: str, amount_kobo: int, reference: str, metadata: dict
+    email: str, amount_kobo: int, reference: str, metadata: dict, callback_url: Optional[str] = None
 ) -> dict:
-    data = await _request(
-        "POST",
-        "/transaction/initialize",
-        json={"email": email, "amount": amount_kobo, "reference": reference, "metadata": metadata},
-    )
+    body = {"email": email, "amount": amount_kobo, "reference": reference, "metadata": metadata}
+    if callback_url:
+        body["callback_url"] = callback_url
+    data = await _request("POST", "/transaction/initialize", json=body)
     return data["data"]
+
+
+async def list_banks() -> list:
+    """Every Nigerian bank Paystack can pay into (follows its cursor
+    pagination)."""
+    banks, cursor = [], None
+    for _ in range(20):
+        params = {"country": "nigeria", "currency": "NGN", "perPage": 100, "use_cursor": "true"}
+        if cursor:
+            params["next"] = cursor
+        data = await _request("GET", "/bank", params=params)
+        banks.extend(data.get("data") or [])
+        cursor = (data.get("meta") or {}).get("next")
+        if not cursor:
+            break
+    return banks
 
 
 async def verify_transaction(reference: str) -> dict:

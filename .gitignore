@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 .test_mail.py
+# User-uploaded media (served from /static, never source)
+static/uploads/
+
+# Load-test artifacts (scripts/load_test.py)
+loadtest_accounts.json
+loadtest_results.json

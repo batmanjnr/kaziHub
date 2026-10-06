@@ -37,6 +37,7 @@ from app.models.profile import Profile
 from app.models.review import Review
 from app.models.service import Service
 from app.models.session import UserSession
+from app.models.support_ticket import SupportTicket
 from app.models.transaction import Transaction
 from app.models.user import User
 from app.models.user_role import UserRole
@@ -44,6 +45,7 @@ from app.models.verification import Verification
 from app.models.webhook_event import ProcessedWebhookEvent
 from app.services.jobs.auto_release import run_auto_release
 from app.services.jobs.cleanup import cleanup_expired_otps_and_sessions
+from app.services.jobs.email_summary import send_daily_email_summaries
 from app.services.jobs.notify import dispatch_pending_notifications
 from app.services.jobs.webhook_retry import retry_failed_webhooks
 
@@ -68,7 +70,7 @@ async def _run_guarded(name: str, coro_fn) -> None:
 
 
 async def main():
-    client = AsyncIOMotorClient(settings.MONGODB_URL, tlsCAFile=certifi.where())
+    client = AsyncIOMotorClient(settings.MONGODB_URL, tlsCAFile=certifi.where(), tz_aware=True)
     await init_beanie(
         database=client[settings.DATABASE_NAME],
         document_models=[
@@ -94,6 +96,7 @@ async def main():
             ProcessedWebhookEvent,
             UserSession,
             IdempotencyRecord,
+            SupportTicket,
         ],
     )
 
@@ -109,6 +112,10 @@ async def main():
     scheduler.add_job(
         _run_guarded, args=["notify_dispatch", dispatch_pending_notifications],
         trigger=IntervalTrigger(minutes=5), id="notify_dispatch",
+    )
+    scheduler.add_job(
+        _run_guarded, args=["email_summary", send_daily_email_summaries],
+        trigger=CronTrigger(hour=7, minute=0, timezone="Africa/Lagos"), id="email_summary",
     )
     scheduler.add_job(
         _run_guarded, args=["webhook_retry", retry_failed_webhooks],

@@ -35,6 +35,40 @@ async def test_user_role_split_allows_dual_capability():
     assert {r.role for r in roles} == {"client", "artisan"}
 
 
+async def test_mutable_default_lists_are_not_shared_between_instances():
+    first = User(
+        first_name="Ada",
+        last_name="Lovelace",
+        email="ada@example.com",
+        phone_number="+2348000000001",
+        state="Lagos",
+        role="client",
+        hashed_password="hashed",
+    )
+    second = User(
+        first_name="Grace",
+        last_name="Hopper",
+        email="grace@example.com",
+        phone_number="+2348000000002",
+        state="Abuja",
+        role="artisan",
+        hashed_password="hashed",
+    )
+
+    first.roles.append("artisan")
+    first.roles.append("admin")
+
+    assert second.roles == []
+    assert first.roles == ["artisan", "admin"]
+
+    profile_one = Profile(user=first, category="plumbing", state="Lagos")
+    profile_two = Profile(user=second, category="electrical", state="Abuja")
+    profile_one.skills.append("pipe fitting")
+
+    assert profile_two.skills == []
+    assert profile_one.skills == ["pipe fitting"]
+
+
 async def test_gig_is_keyed_to_artisan_profile_not_user():
     user = await make_user()
     profile = Profile(user=user, category="plumbing", state="Lagos")

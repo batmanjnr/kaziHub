@@ -1,6 +1,6 @@
 # app/api/v1/endpoints/profiles.py
 import asyncio
-from typing import List, Optional
+from typing import Annotated, Dict, Iterable, List, Optional
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -17,6 +17,7 @@ from app.models.profile import (
 from app.models.review import Review, ReviewResponse
 from app.models.service import Service, ServiceResponse
 from app.models.user import User
+from app.core.time import utc_now
 
 router = APIRouter()
 
@@ -24,10 +25,23 @@ MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
 
 
-def build_profile_response(profile: Profile, for_owner: bool = True) -> ProfileResponse:
-    user_id = str(
-        profile.user.ref.id if hasattr(profile.user, "ref") else profile.user.id
-    )
+def profile_user_id(profile: Profile) -> PydanticObjectId:
+    return profile.user.ref.id if hasattr(profile.user, "ref") else profile.user.id
+
+
+async def load_owners(profiles: Iterable[Profile]) -> Dict[PydanticObjectId, User]:
+    """One query for the owning users of a page of profiles (ask 1)."""
+    ids = list({profile_user_id(p) for p in profiles})
+    if not ids:
+        return {}
+    users = await User.find({"_id": {"$in": ids}}).to_list()
+    return {u.id: u for u in users}
+
+
+def build_profile_response(
+    profile: Profile, for_owner: bool = True, owner: Optional[User] = None
+) -> ProfileResponse:
+    user_id = str(profile_user_id(profile))
 
     # The owner always sees their own neighborhood; public callers (search
     # results, profile detail) only see it when share_neighborhood is on.
@@ -36,6 +50,9 @@ def build_profile_response(profile: Profile, for_owner: bool = True) -> ProfileR
     return ProfileResponse(
         id=str(profile.id),
         user_id=user_id,
+        first_name=owner.first_name if owner else None,
+        last_name=owner.last_name if owner else None,
+        profile_picture=owner.profile_picture if owner else None,
         business_name=profile.business_name,
         category=profile.category,
         tagline=profile.tagline,
@@ -135,6 +152,7 @@ def build_review_response(review: Review) -> ReviewResponse:
         comment=review.comment,
         client_name=review.client_name,
         is_verified_booking=review.is_verified_booking,
+        share_publicly=review.share_publicly,
         created_at=review.created_at,
     )
 
@@ -146,7 +164,13 @@ async def list_profiles(
     state: Optional[str] = None,
     min_rating: Optional[float] = Query(default=None, ge=0, le=5),
     min_experience: Optional[int] = Query(default=None, ge=0),
-    available_only: bool = False,
+    available_only: Annotated[
+        bool, Query(description="Only artisans accepting new work (is_available), online or not.")
+    ] = False,
+    online_now: Annotated[
+        bool, Query(description="Only artisans online right now (availability_status 'Available').")
+    ] = False,
+    verified_only: Annotated[bool, Query(description="Only ID-verified artisans.")] = False,
     search: Optional[str] = None,
     near_lat: Optional[float] = None,
     near_lng: Optional[float] = None,
@@ -154,8 +178,17 @@ async def list_profiles(
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
 ):
-    """Public search endpoint to browse verified artisans."""
-    query: dict = {"is_paused": {"$ne": True}}
+    """Public search for artisans.
+
+    Lists verified and unverified artisans alike; show a badge when
+    `is_verified` is true, or pass `verified_only=true` (ask 5). Frozen
+    accounts and unfinished profiles (no category yet) are never listed,
+    and `meta.total`/`has_more` count only what a customer can see (ask 2).
+    """
+    query: dict = {
+        "is_paused": {"$ne": True},
+        "category": {"$nin": ["", None]},
+    }
     if category:
         query["category"] = category
     if neighborhood:
@@ -167,7 +200,11 @@ async def list_profiles(
     if min_experience is not None:
         query["years_of_experience"] = {"$gte": min_experience}
     if available_only:
+        query["is_available"] = True
+    if online_now:
         query["availability_status"] = "Available"
+    if verified_only:
+        query["is_verified"] = True
     if search:
         # Portable case-insensitive substring match rather than the $text
         # index (which mongomock doesn't support and which can't combine
@@ -216,8 +253,12 @@ async def list_profiles(
             .to_list(),
         )
 
+    owners = await load_owners(profiles)
     return ProfileListResponse(
-        data=[build_profile_response(p, for_owner=False) for p in profiles],
+        data=[
+            build_profile_response(p, for_owner=False, owner=owners.get(profile_user_id(p)))
+            for p in profiles
+        ],
         meta=ProfileListMeta(
             total=total,
             limit=limit,
@@ -233,17 +274,26 @@ async def create_or_update_profile(
     current_user: User = Depends(get_current_artisan),  # Requires artisan role
 ):
     """Create or update profile (Artisans only)."""
+    _check_neighborhood(profile_in.neighborhood, current_user.state)
     existing_profile = await Profile.find_one({"user.$id": current_user.id})
 
     if existing_profile:
         await existing_profile.set(profile_in.model_dump(exclude_unset=True))
-        return build_profile_response(existing_profile)
+        return build_profile_response(existing_profile, owner=current_user)
 
-    profile = Profile(
-        user=current_user, state=current_user.state, **profile_in.model_dump()
-    )
+    data = profile_in.model_dump()
+    data = {k: v for k, v in data.items() if v is not None}
+    profile = Profile(user=current_user, state=current_user.state, **data)
     await profile.insert()
-    return build_profile_response(profile)
+    return build_profile_response(profile, owner=current_user)
+
+
+def _check_neighborhood(neighborhood: Optional[str], state: str) -> None:
+    if neighborhood and neighborhood.strip().lower() == (state or "").strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="neighborhood should be the area within your state, not the state itself.",
+        )
 
 
 @router.get("/me", response_model=ProfileResponse)
@@ -256,7 +306,7 @@ async def get_my_profile(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found"
         )
-    return build_profile_response(profile)
+    return build_profile_response(profile, owner=current_user)
 
 
 @router.put("/me", response_model=ProfileResponse)
@@ -273,30 +323,33 @@ async def update_my_profile(
 
     update_data = profile_in.model_dump(exclude_unset=True)
 
+    if update_data.get("neighborhood"):
+        _check_neighborhood(update_data["neighborhood"], profile.state)
+
+    # base_price > 0 unless quote_required, checked against whichever of
+    # the two this request doesn't change (ask 37).
+    pricing_type = update_data.get("pricing_type", profile.pricing_type)
+    base_price = update_data.get("base_price", profile.base_price)
+    if ("pricing_type" in update_data or "base_price" in update_data) and pricing_type != "quote_required":
+        if base_price is None or base_price <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="base_price must be greater than 0 unless pricing_type is 'quote_required'.",
+            )
+
     if "latitude" in update_data or "longitude" in update_data:
         lat = update_data.get("latitude", profile.latitude)
         lng = update_data.get("longitude", profile.longitude)
         update_data["geo_location"] = make_geo_point(lat, lng)
 
     if "availability_status" in update_data:
-        if update_data["availability_status"] not in ("Available", "Busy", "Offline"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid availability_status.",
-            )
         update_data["is_available_now"] = update_data["availability_status"] == "Available"
 
-    if "phone_visibility" in update_data:
-        if update_data["phone_visibility"] not in ("after_escrow", "verified_only", "hidden"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid phone_visibility.",
-            )
-
     if update_data:
+        update_data["updated_at"] = utc_now()
         await profile.set(update_data)
 
-    return build_profile_response(profile)
+    return build_profile_response(profile, owner=current_user)
 
 
 @router.delete("/me", status_code=status.HTTP_200_OK)
@@ -318,25 +371,24 @@ async def delete_my_profile(
 async def get_profile_detail(profile_id: str):
     """Full public profile: portfolio, catalog services, and reviews.
 
-    Phone numbers are intentionally never included here — full
-    phone_visibility enforcement (after_escrow / verified_only) needs
-    booking context, which lands with the escrow rewrite in Phase 4.
+    Phone numbers are never included here; a client sees the artisan's
+    number on their booking once phone_visibility allows it. A frozen
+    artisan's page is 404, the same as their absence from search (ask 17).
     """
     try:
         profile = await Profile.get(PydanticObjectId(profile_id))
     except Exception:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid profile ID.")
 
-    if not profile:
+    if not profile or profile.is_paused:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
 
-    artisan_user_id = (
-        profile.user.ref.id if hasattr(profile.user, "ref") else profile.user.id
-    )
+    artisan_user_id = profile_user_id(profile)
     # Independent of each other — issued concurrently instead of one round
     # trip after another, which matters a lot against a remote Atlas
     # cluster where each round trip alone can cost 100ms+.
-    services, portfolio, reviews = await asyncio.gather(
+    owner, services, portfolio, reviews = await asyncio.gather(
+        User.get(artisan_user_id),
         Service.find({"artisan_profile.$id": profile.id, "is_active": True}).to_list(),
         PortfolioItem.find({"artisan_profile.$id": profile.id}).to_list(),
         Review.find({"artisan.$id": artisan_user_id})
@@ -345,7 +397,10 @@ async def get_profile_detail(profile_id: str):
         .to_list(),
     )
 
-    base = build_profile_response(profile, for_owner=False)
+    if owner and owner.is_paused:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+
+    base = build_profile_response(profile, for_owner=False, owner=owner)
     return PublicProfileDetailResponse(
         **base.model_dump(),
         services=[build_service_response(s) for s in services],

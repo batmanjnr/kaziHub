@@ -1,11 +1,14 @@
 # app/api/v1/endpoints/payments.py
+import time
+from typing import List
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from app.api.deps import get_current_artisan
+from app.api.deps import get_current_artisan, get_current_user
 from app.models.bank_account import BankAccount, BankAccountResponse
 from app.models.user import User
-from app.services.paystack import PaystackError, create_transfer_recipient, resolve_account_number
+from app.services.paystack import PaystackError, create_transfer_recipient, list_banks, resolve_account_number
 
 router = APIRouter()
 
@@ -13,6 +16,41 @@ router = APIRouter()
 class VerifyBankAccountRequest(BaseModel):
     bank_code: str
     account_number: str
+
+
+class BankOption(BaseModel):
+    code: str
+    name: str
+
+
+BANKS_CACHE_SECONDS = 24 * 60 * 60
+_banks_cache: dict = {"at": 0.0, "banks": []}
+
+
+@router.get("/banks", response_model=List[BankOption])
+async def get_banks(current_user: User = Depends(get_current_user)):
+    """Banks an artisan can be paid into, A-Z (ask 21). Send the chosen
+    `code` as `bank_code` to POST /payments/verify-bank-account. Sourced
+    from Paystack and cached for 24 hours."""
+    if not _banks_cache["banks"] or time.time() - _banks_cache["at"] > BANKS_CACHE_SECONDS:
+        try:
+            raw = await list_banks()
+        except PaystackError as e:
+            if _banks_cache["banks"]:
+                return _banks_cache["banks"]
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=e.client_message())
+        seen, banks = set(), []
+        for b in raw:
+            code, name = b.get("code"), b.get("name")
+            if not code or not name or not b.get("active", True) or b.get("is_deleted"):
+                continue
+            if (code, name) in seen:
+                continue
+            seen.add((code, name))
+            banks.append(BankOption(code=code, name=name))
+        _banks_cache["banks"] = sorted(banks, key=lambda x: x.name.lower())
+        _banks_cache["at"] = time.time()
+    return _banks_cache["banks"]
 
 
 def build_bank_account_response(b: BankAccount) -> BankAccountResponse:

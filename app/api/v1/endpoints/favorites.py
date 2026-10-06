@@ -4,15 +4,21 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.reviews import resolve_artisan_user_id
 from app.models.favorite import FavoriteResponse, SavedProfessional
 from app.models.profile import Profile
 from app.models.user import User
 
 router = APIRouter()
 
+PRO_ID_DOC = (
+    "`pro_id` is the artisan's **user id** (a profile's `user_id`); their profile id is also accepted."
+)
+
 
 @router.get("/", response_model=List[FavoriteResponse])
 async def list_favorites(current_user: User = Depends(get_current_user)):
+    """Saved artisans. `artisan_id` is the artisan's user id."""
     saved = (
         await SavedProfessional.find({"user.$id": current_user.id})
         .sort("-created_at")
@@ -36,12 +42,9 @@ async def list_favorites(current_user: User = Depends(get_current_user)):
     return results
 
 
-@router.post("/{pro_id}", status_code=status.HTTP_201_CREATED)
+@router.post("/{pro_id}", status_code=status.HTTP_201_CREATED, description=PRO_ID_DOC)
 async def save_professional(pro_id: str, current_user: User = Depends(get_current_user)):
-    try:
-        artisan_id = PydanticObjectId(pro_id)
-    except Exception:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid professional ID.")
+    artisan_id = await resolve_artisan_user_id(pro_id)
 
     artisan = await User.get(artisan_id)
     if not artisan:
@@ -60,12 +63,9 @@ async def save_professional(pro_id: str, current_user: User = Depends(get_curren
     return {"detail": "Professional saved."}
 
 
-@router.delete("/{pro_id}", status_code=status.HTTP_200_OK)
+@router.delete("/{pro_id}", status_code=status.HTTP_200_OK, description=PRO_ID_DOC)
 async def unsave_professional(pro_id: str, current_user: User = Depends(get_current_user)):
-    try:
-        artisan_id = PydanticObjectId(pro_id)
-    except Exception:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid professional ID.")
+    artisan_id = await resolve_artisan_user_id(pro_id)
 
     existing = await SavedProfessional.find_one(
         {"user.$id": current_user.id, "artisan.$id": artisan_id}

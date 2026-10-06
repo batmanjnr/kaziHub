@@ -10,6 +10,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.api.v1.router import api_router
 from app.core.config import settings
+from app.core.errors import APIError, CatchAllErrorsMiddleware, api_error_handler
+from app.core.time import utc_now
 from app.core.rate_limit import GlobalRateLimitMiddleware
 from app.core.security_headers import SecurityHeadersMiddleware
 from app.models.audit_log import AuditLog
@@ -28,6 +30,7 @@ from app.models.profile import Profile
 from app.models.review import Review
 from app.models.service import Service
 from app.models.session import UserSession
+from app.models.support_ticket import SupportTicket
 from app.models.transaction import Transaction
 from app.models.user import User
 from app.models.user_role import UserRole
@@ -57,6 +60,9 @@ async def lifespan(app: FastAPI):
         # zlib is a stdlib codec, no extra dependency — trims wire size
         # for larger query results (lists, profile detail payloads).
         compressors="zlib",
+        # Datetimes come back timezone-aware (UTC), so every API response
+        # carries an explicit offset, e.g. "2026-09-25T03:28:33Z" (asks 16, 35).
+        tz_aware=True,
     )
     database = client[settings.DATABASE_NAME]
 
@@ -86,6 +92,7 @@ async def lifespan(app: FastAPI):
             ProcessedWebhookEvent,
             UserSession,
             IdempotencyRecord,
+            SupportTicket,
         ]
     )
     yield
@@ -98,8 +105,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.add_exception_handler(APIError, api_error_handler)
+
 # 2. Mount static directory for uploads
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# 2b. Innermost: turn any unhandled error into a JSON 500. Added before
+# CORS so the error response still carries CORS headers (frontend ask 33).
+app.add_middleware(CatchAllErrorsMiddleware)
 
 # 3. Add CORS Middleware
 app.add_middleware(
@@ -122,3 +135,14 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # 4. Include API Router
 app.include_router(api_router, prefix="/api/v1")
+
+
+@app.head("/health", include_in_schema=False)
+@app.get("/health", tags=["Health"])
+async def health():
+    """Liveness check for uptime monitors and the keep-alive ping (ask 6).
+    `paystack_mode` says whether payments run on Paystack test or live keys
+    (ask 25)."""
+    key = settings.PAYSTACK_SECRET_KEY
+    mode = "test" if key.startswith("sk_test_") else "live" if key.startswith("sk_live_") else "unconfigured"
+    return {"status": "ok", "time": utc_now(), "paystack_mode": mode}

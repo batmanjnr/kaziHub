@@ -11,6 +11,8 @@ yet-completed event.
 from datetime import datetime
 from typing import Optional
 from beanie import Document
+from app.core.time import utc_now
+from pydantic import Field
 from pymongo import IndexModel
 
 WEBHOOK_EVENT_STATUSES = ("processing", "completed", "failed_pending_retry")
@@ -25,7 +27,7 @@ class ProcessedWebhookEvent(Document):
     attempts: int = 0
     next_retry_at: Optional[datetime] = None
     last_error: Optional[str] = None
-    processed_at: datetime = datetime.utcnow()
+    processed_at: datetime = Field(default_factory=utc_now)
 
     class Settings:
         name = "processed_webhook_events"

@@ -1,12 +1,15 @@
 import hmac
 import hashlib
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from pydantic import BaseModel, Field
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from app.api.deps import get_current_user
-from app.api.v1.endpoints.bookings import core_confirm_completion
+from app.api.v1.endpoints.bookings import core_confirm_completion, notify_escrow_funded
 from app.core.config import settings
 from app.core.websocket_manager import manager
 from app.models.audit_log import AuditLog
@@ -23,12 +26,35 @@ from app.services.paystack import PaystackError, initialize_transaction
 router = APIRouter()
 
 
-@router.post("/initialize-escrow/{booking_id}")
+class EscrowCheckoutResponse(BaseModel):
+    authorization_url: str = Field(description="Send the client here to pay (Paystack checkout).")
+    access_code: str = Field(description="For Paystack's inline/popup JS instead of a redirect.")
+    reference: str = Field(description="This payment's reference; Paystack adds it to the callback URL.")
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="Where Paystack sends the client after paying: the PAYSTACK_CALLBACK_URL setting plus "
+        "`?booking_id=...`; Paystack appends `&reference=...&trxref=...`.",
+    )
+
+
+@router.post("/initialize-escrow/{booking_id}", response_model=EscrowCheckoutResponse)
 async def initialize_escrow_payment(
     booking_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Initialize Paystack checkout for escrow funding."""
+    """Start paying a booking into escrow (ask 25).
+
+    1. Call this when the booking is `pending` or `accepted` and unfunded.
+    2. Redirect the client to `authorization_url`.
+    3. Paystack sends them back to `callback_url`. That page calls
+       POST /bookings/{booking_id}/fund-escrow (with an Idempotency-Key),
+       which confirms the payment with Paystack if the webhook hasn't
+       already, and returns the booking as `escrow_funded`.
+
+    The webhook (POST /wallet/webhook/paystack) also funds the booking on
+    its own, so the client closing the tab before the redirect is fine.
+    GET /health reports `paystack_mode` ("test" or "live").
+    """
     booking = await Booking.get(ObjectId(booking_id))
     if not booking or str(booking.client.ref.id) != str(current_user.id):
         raise HTTPException(status_code=403, detail="Unauthorized.")
@@ -55,12 +81,18 @@ async def initialize_escrow_payment(
     )
     await tx.insert()
 
+    callback_url = None
+    if settings.PAYSTACK_CALLBACK_URL:
+        joiner = "&" if "?" in settings.PAYSTACK_CALLBACK_URL else "?"
+        callback_url = f"{settings.PAYSTACK_CALLBACK_URL}{joiner}booking_id={booking.id}"
+
     try:
         data = await initialize_transaction(
             email=current_user.email,
-            amount_kobo=int(amount * 100),
+            amount_kobo=int(round(amount * 100)),
             reference=ref,
             metadata={"booking_id": str(booking.id)},
+            callback_url=callback_url,
         )
     except PaystackError as e:
         raise HTTPException(status_code=400, detail=f"Payment initialization failed: {e.client_message()}")
@@ -69,6 +101,7 @@ async def initialize_escrow_payment(
         "authorization_url": data["authorization_url"],
         "access_code": data["access_code"],
         "reference": ref,
+        "callback_url": callback_url,
     }
 
 
@@ -129,11 +162,12 @@ async def _handle_charge_success(data: dict) -> None:
             "amount": booking.amount,
             "status": booking.status,
         })
+    await notify_escrow_funded(booking)
 
 
 async def _handle_transfer_event(event_type: str, data: dict) -> None:
     """Handles transfer.success/failed/reversed for an artisan payout
-    initiated via app.services.payouts.request_artisan_payout.
+    initiated via app.services.payouts.release_escrow_with_payout.
 
     A failed/reversed transfer means the booking was already marked
     paid_out but the money never arrived — this flips the ledger entry to
@@ -240,7 +274,10 @@ async def paystack_webhook(request: Request, x_paystack_signature: str = Header(
     )
     try:
         await record.insert()
-    except Exception:
+    except DuplicateKeyError:
+        # Replayed delivery of an event we've already claimed. Any other
+        # insert failure (DB down, etc.) propagates as a 500 so Paystack
+        # redelivers it instead of us silently dropping a real event.
         return {"status": "success"}
 
     try:

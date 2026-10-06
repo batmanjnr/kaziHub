@@ -1,0 +1,18 @@
+# Pings the API every 10 minutes so the host's idle spin-down never kicks
+# in (frontend ask 6). Render's free tier sleeps after 15 idle minutes.
+# Set the repository variable API_HEALTH_URL to override the default.
+name: Keep API awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: |
+          url="${{ vars.API_HEALTH_URL || 'https://kazihub-52ph.onrender.com/health' }}"
+          curl --fail --silent --show-error --max-time 60 --retry 3 --retry-delay 10 "$url"

@@ -32,7 +32,7 @@ async def _register_and_verify(email: str, nin: str, phone: str):
         FakeRequest(),
         UserCreate(
             first_name="A", last_name="B", email=email, password="Passw0rd!",
-            phone_number=phone, nin=nin, state="Lagos", role="client",
+            phone_number=phone, nin=nin, state="Lagos", role="client", terms_version="2026-09-01",
         ),
         BackgroundTasks(),
     )
@@ -49,7 +49,7 @@ async def test_second_registration_with_same_nin_is_rejected_at_register():
             UserCreate(
                 first_name="C", last_name="D", email="ninattacker@example.com",
                 password="Passw0rd!", phone_number="+2348222222222",
-                nin="11122233344", state="Lagos", role="client",
+                nin="11122233344", state="Lagos", role="client", terms_version="2026-09-01",
             ),
             BackgroundTasks(),
         )
@@ -75,7 +75,7 @@ async def test_updating_nin_to_one_already_claimed_is_rejected():
     await _register_and_verify("ninholder@example.com", "99988877766", "+2348555555555")
     other_user = User(
         first_name="E", last_name="F", email="otherperson@example.com",
-        phone_number="+2348666666666", state="Lagos", role="client",
+        phone_number="+2348666666666", state="Lagos", role="client", terms_version="2026-09-01",
         hashed_password=get_password_hash("Passw0rd!"),
     )
     await other_user.insert()

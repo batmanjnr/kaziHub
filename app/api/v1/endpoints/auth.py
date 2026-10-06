@@ -6,17 +6,24 @@ from uuid import uuid4
 
 import pyotp
 from beanie import PydanticObjectId
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.cloudinary import delete_file_from_cloudinary, upload_file_to_cloudinary
 from app.core.encryption import decrypt_optional, encrypt_optional, encrypt_str, mask_tail
 from app.core.nin_hash import compute_nin_hash
-from app.core.rate_limit import rate_limiter
-from app.core.two_factor import verify_totp_code
+from app.core.constants import LANGUAGE_LABEL_PREFIXES, LANGUAGES
+from app.core.errors import APIError
+from app.core.rate_limit import get_client_ip, rate_limiter
+from app.core.time import utc_now
+from app.core.two_factor import (
+    generate_backup_codes,
+    totp_code_is_valid,
+    verify_totp_or_backup_code,
+)
 from app.core.upload_validation import IMAGE_TYPES, validate_upload
 from app.services.moderation import moderate_image
 from app.core.security import (
@@ -42,8 +49,10 @@ from app.schemas.auth import (
     ChangePasswordSchema,
     ConfirmEmailChangeSchema,
     ForgotPasswordSchema,
+    LogoutSchema,
     RequestEmailChangeSchema,
     ResetPasswordSchema,
+    TwoFactorDisableSchema,
 )
 from app.services.email import send_email_change_otp, send_otp_email, send_password_reset_email
 
@@ -70,8 +79,16 @@ def generate_otp() -> str:
     return str(random.randint(10000, 99999))
 
 
-def get_client_ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+def normalize_language(value: Optional[str]) -> str:
+    """Older accounts hold full labels like "English (Nigeria)"; always
+    report a code from LANGUAGES (ask 20)."""
+    if value in LANGUAGES:
+        return value
+    lowered = (value or "").strip().lower()
+    for prefix, code in LANGUAGE_LABEL_PREFIXES.items():
+        if lowered.startswith(prefix):
+            return code
+    return "en"
 
 
 def build_user_response(user: User) -> UserResponse:
@@ -90,9 +107,15 @@ def build_user_response(user: User) -> UserResponse:
         is_admin=user.is_admin,
         is_active=user.is_active,
         is_email_verified=user.is_email_verified,
+        is_paused=user.is_paused,
+        two_factor_enabled=user.two_factor_enabled,
         profile_picture=user.profile_picture,
-        theme=getattr(user, "theme", "system"),
-        preferred_language=getattr(user, "preferred_language", "en"),
+        theme=user.theme if user.theme in ("light", "dark", "system") else "system",
+        preferred_language=normalize_language(user.preferred_language),
+        phone_visibility=user.phone_visibility,
+        share_neighborhood=user.share_neighborhood,
+        terms_version=user.terms_version,
+        terms_accepted_at=user.terms_accepted_at,
         created_at=user.created_at,
     )
 
@@ -101,10 +124,15 @@ async def issue_token_pair(
     user: User, family_id: Optional[str] = None, request: Optional[Request] = None
 ) -> TokenPair:
     """Issue a new access/refresh pair. Passing `family_id` continues an
-    existing rotation chain (refresh); omitting it starts a new one (login)."""
+    existing rotation chain (refresh); omitting it starts a new one (login).
+
+    The family id doubles as the session id: it's the access token's `sid`
+    claim (asks 9 and 19), stable across refreshes of the same login."""
+    family_id = family_id or str(uuid4())
     access_token = create_access_token(
         data={
             "sub": str(user.id),
+            "sid": family_id,
             "roles": user.roles,
             "is_admin": user.is_admin,
             "token_version": user.token_version,
@@ -117,7 +145,7 @@ async def issue_token_pair(
     session = UserSession(
         user=user,
         refresh_token_hash=hash_refresh_token(refresh_token),
-        family_id=family_id or str(uuid4()),
+        family_id=family_id,
         expires_at=now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
         user_agent=request.headers.get("user-agent") if request else None,
         ip_address=get_client_ip(request) if request else None,
@@ -129,7 +157,9 @@ async def issue_token_pair(
 
 
 async def revoke_all_sessions_for(user: User) -> None:
-    await UserSession.find({"user.$id": user.id}).update({"$set": {"is_revoked": True}})
+    await UserSession.find({"user.$id": user.id, "is_revoked": False}).update(
+        {"$set": {"is_revoked": True, "revoked_reason": "signed_out"}}
+    )
 
 
 async def deactivate_account(user: User) -> None:
@@ -195,6 +225,8 @@ async def register(request: Request, user_in: UserCreate, background_tasks: Back
         pending_user.otp_code = otp
         pending_user.otp_expires_at = otp_expiry
         pending_user.otp_attempts = 0
+        pending_user.terms_version = user_in.terms_version
+        pending_user.terms_accepted_at = now
         await pending_user.save()
     else:
         # Create new staged pending user document
@@ -210,6 +242,8 @@ async def register(request: Request, user_in: UserCreate, background_tasks: Back
             hashed_password=get_password_hash(user_in.password),
             otp_code=otp,
             otp_expires_at=otp_expiry,
+            terms_version=user_in.terms_version,
+            terms_accepted_at=now,
             created_at=now,
         )
         await pending_user.insert()
@@ -277,6 +311,8 @@ async def verify_email(payload: VerifyEmailSchema):
         roles=roles,
         hashed_password=pending_user.hashed_password,
         is_email_verified=True,
+        terms_version=pending_user.terms_version,
+        terms_accepted_at=pending_user.terms_accepted_at,
         created_at=pending_user.created_at,
     )
     try:
@@ -343,50 +379,63 @@ async def resend_otp(payload: ResendOTPSchema, background_tasks: BackgroundTasks
     return {"detail": "A new 5-digit OTP has been sent to your email."}
 
 
-@router.post("/login", response_model=TokenPair)
+@router.post(
+    "/login",
+    response_model=TokenPair,
+    responses={
+        401: {
+            "description": (
+                "Every 401 carries a machine-readable `code`: `invalid_credentials` (wrong email or "
+                "password), `totp_required` (password correct, account has 2FA on, no code sent), or "
+                "`totp_invalid` (code wrong or expired). The 2FA codes are only ever returned after the "
+                "password has been checked."
+            ),
+            "content": {"application/json": {"example": {"detail": "Enter your 2FA code to continue.", "code": "totp_required"}}},
+        },
+        423: {"description": "`account_suspended` or `account_deleted`."},
+    },
+)
 async def login(
     request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
-    totp_code: Optional[str] = Form(default=None),
+    totp_code: Optional[str] = Form(
+        default=None,
+        description="6-digit authenticator code, or an unused backup code, when the account has 2FA on.",
+    ),
 ):
     """Authenticate user and return an access/refresh token pair.
 
-    FIX (high-assurance security review): a user who opted into 2FA via
-    /auth/2fa/verify previously got no actual protection from it — nothing
-    in the login path checked `two_factor_enabled` at all, only admin-only
-    routes did (via get_current_admin). The flag was cosmetic for every
-    non-admin account. Login now requires a valid TOTP code whenever the
-    account has 2FA enabled, regardless of role.
+    Send `username` (the email), `password` and, for accounts with 2FA on,
+    `totp_code`, as form fields. See the 401 response for how a missing or
+    wrong 2FA code is reported (frontend ask 41).
     """
     ip = get_client_ip(request)
     rate_limiter.hit(f"login:{ip}:{form_data.username}", limit=5, window_seconds=900)
 
     user = await User.find_one(User.email == form_data.username)
     if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
+        raise APIError(
+            status.HTTP_401_UNAUTHORIZED,
+            "Incorrect email or password",
+            code="invalid_credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
     if user.deleted_at is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Account no longer exists."
-        )
+        raise APIError(status.HTTP_423_LOCKED, "Account no longer exists.", code="account_deleted")
 
     if not user.is_active or user.is_frozen:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Inactive account",
-        )
+        raise APIError(status.HTTP_423_LOCKED, "This account has been suspended.", code="account_suspended")
 
     if user.two_factor_enabled:
         if not totp_code:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"code": "totp_required", "message": "Enter your 2FA code to continue."},
+            raise APIError(
+                status.HTTP_401_UNAUTHORIZED, "Enter your 2FA code to continue.", code="totp_required"
             )
-        verify_totp_code(user, totp_code)
+        if not await verify_totp_or_backup_code(user, totp_code.strip()):
+            raise APIError(
+                status.HTTP_401_UNAUTHORIZED, "That 2FA code is wrong or has expired.", code="totp_invalid"
+            )
 
     return await issue_token_pair(user, request=request)
 
@@ -407,12 +456,20 @@ async def refresh_token(payload: RefreshRequest, request: Request):
         )
 
     if session.is_revoked:
+        if session.revoked_reason == "signed_out":
+            # The device was signed out on purpose (ask 19) — not theft.
+            raise APIError(
+                status.HTTP_401_UNAUTHORIZED, "This session was signed out.", code="session_signed_out"
+            )
+        # A refresh token that was already spent by a rotation being used
+        # again: treat as stolen and end that whole login.
         await UserSession.find({"family_id": session.family_id}).update(
             {"$set": {"is_revoked": True}}
         )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token reuse detected; all sessions for this login have been revoked.",
+        raise APIError(
+            status.HTTP_401_UNAUTHORIZED,
+            "Refresh token reuse detected; this login has been signed out for safety.",
+            code="refresh_token_reused",
         )
 
     expires_at = session.expires_at
@@ -439,9 +496,25 @@ async def refresh_token(payload: RefreshRequest, request: Request):
     # Single-use: this token is now spent, whether or not the caller ever
     # sees the new pair.
     session.is_revoked = True
+    session.revoked_reason = "rotated"
     await session.save()
 
     return await issue_token_pair(user, family_id=session.family_id, request=request)
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def logout(payload: LogoutSchema):
+    """Sign out this device only (ask 8): revokes the session the given
+    refresh token belongs to. Its access token stops working at once too.
+    Always 204, so it can't be used to probe which tokens exist."""
+    session = await UserSession.find_one(
+        UserSession.refresh_token_hash == hash_refresh_token(payload.refresh_token)
+    )
+    if session:
+        await UserSession.find({"family_id": session.family_id, "is_revoked": False}).update(
+            {"$set": {"is_revoked": True, "revoked_reason": "signed_out"}}
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/revoke-sessions", status_code=status.HTTP_200_OK)
@@ -569,22 +642,22 @@ async def update_user_me(
         current_user.nin_encrypted = encrypt_optional(nin_value)
         current_user.nin_hash = new_hash
 
-    # Validate theme input if provided
-    if "theme" in update_data and update_data["theme"]:
-        allowed_themes = ["light", "dark", "system"]
-        if update_data["theme"].lower() not in allowed_themes:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid theme. Must be one of {allowed_themes}",
-            )
-        update_data["theme"] = update_data["theme"].lower()
+    # theme, preferred_language, names, phone and state are validated by
+    # UserUpdate itself (422 on anything else — asks 20 and 37).
 
     for field, value in update_data.items():
         if hasattr(current_user, field) and value is not None:
             setattr(current_user, field, value)
 
-    current_user.updated_at = datetime.now(timezone.utc)
+    current_user.updated_at = utc_now()
     await current_user.save()
+
+    # Artisans keep a copy of their state on the profile for search.
+    if "state" in update_data:
+        profile = await Profile.find_one({"user.$id": current_user.id})
+        if profile:
+            await profile.set({"state": current_user.state})
+
     return build_user_response(current_user)
 
 
@@ -652,6 +725,17 @@ class TwoFactorVerifySchema(BaseModel):
     totp_code: str
 
 
+class TwoFactorEnabledResponse(BaseModel):
+    detail: str
+    backup_codes: List[str] = Field(
+        description="Ten single-use recovery codes. Shown only once — the user should save them."
+    )
+
+
+class BackupCodesRegenerateSchema(BaseModel):
+    totp_code: str
+
+
 @router.post("/2fa/setup", response_model=TwoFactorSetupResponse)
 async def setup_two_factor(current_user: User = Depends(get_current_user)):
     """Generate a new TOTP secret. 2FA isn't active until /2fa/verify
@@ -666,7 +750,7 @@ async def setup_two_factor(current_user: User = Depends(get_current_user)):
     return TwoFactorSetupResponse(secret=secret, otpauth_url=otpauth_url)
 
 
-@router.post("/2fa/verify", status_code=status.HTTP_200_OK)
+@router.post("/2fa/verify", response_model=TwoFactorEnabledResponse)
 async def verify_two_factor_setup(
     payload: TwoFactorVerifySchema, current_user: User = Depends(get_current_user)
 ):
@@ -684,9 +768,52 @@ async def verify_two_factor_setup(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid 2FA code."
         )
 
+    codes, hashes = generate_backup_codes()
     current_user.two_factor_enabled = True
+    current_user.two_factor_backup_codes = hashes
     await current_user.save()
-    return {"detail": "Two-factor authentication enabled."}
+    return TwoFactorEnabledResponse(detail="Two-factor authentication enabled.", backup_codes=codes)
+
+
+@router.post("/2fa/disable", status_code=status.HTTP_200_OK)
+async def disable_two_factor(
+    payload: TwoFactorDisableSchema, current_user: User = Depends(get_current_user)
+):
+    """Turn 2FA off (ask 10). Needs the current password and either an
+    authenticator code or an unused backup code, so a user who lost their
+    authenticator can still get back in and turn it off."""
+    if not current_user.two_factor_enabled:
+        raise APIError(status.HTTP_409_CONFLICT, "Two-factor authentication is already off.", code="totp_not_enabled")
+    if not verify_password(payload.current_password, current_user.hashed_password):
+        raise APIError(status.HTTP_400_BAD_REQUEST, "Current password is incorrect.", code="invalid_password")
+    if not await verify_totp_or_backup_code(current_user, payload.totp_code.strip()):
+        raise APIError(status.HTTP_400_BAD_REQUEST, "That 2FA code is wrong or has expired.", code="totp_invalid")
+    if current_user.is_admin:
+        raise APIError(
+            status.HTTP_403_FORBIDDEN, "Admin accounts must keep 2FA on.", code="totp_required_for_admin"
+        )
+
+    current_user.two_factor_enabled = False
+    current_user.two_factor_secret_encrypted = None
+    current_user.two_factor_backup_codes = []
+    await current_user.save()
+    return {"detail": "Two-factor authentication disabled."}
+
+
+@router.post("/2fa/backup-codes", response_model=TwoFactorEnabledResponse)
+async def regenerate_backup_codes(
+    payload: BackupCodesRegenerateSchema, current_user: User = Depends(get_current_user)
+):
+    """Replace all backup codes with ten new ones (old ones stop working).
+    Needs a current authenticator code."""
+    if not current_user.two_factor_enabled:
+        raise APIError(status.HTTP_409_CONFLICT, "Two-factor authentication is off.", code="totp_not_enabled")
+    if not totp_code_is_valid(current_user, payload.totp_code.strip()):
+        raise APIError(status.HTTP_400_BAD_REQUEST, "That 2FA code is wrong or has expired.", code="totp_invalid")
+    codes, hashes = generate_backup_codes()
+    current_user.two_factor_backup_codes = hashes
+    await current_user.save()
+    return TwoFactorEnabledResponse(detail="New backup codes issued.", backup_codes=codes)
 
 
 # ==========================================
@@ -703,12 +830,6 @@ async def change_password(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect."
         )
-    if len(payload.new_password) < 8:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New password must be at least 8 characters.",
-        )
-
     current_user.hashed_password = get_password_hash(payload.new_password)
     # Same rationale as reset-password: a password change invalidates any
     # other live sessions in case the old password had leaked.
@@ -725,6 +846,8 @@ async def change_password(
 
 class SessionResponse(BaseModel):
     id: str
+    session_id: str = Field(description="Stable id of this login; matches the access token's `sid` claim.")
+    is_current: bool = Field(description="True for the session making this request.")
     user_agent: Optional[str] = None
     ip_address: Optional[str] = None
     created_at: datetime
@@ -733,9 +856,11 @@ class SessionResponse(BaseModel):
 
 
 @router.get("/sessions", response_model=List[SessionResponse])
-async def list_sessions(current_user: User = Depends(get_current_user)):
+async def list_sessions(request: Request = None, current_user: User = Depends(get_current_user)):
     """List this user's active (non-revoked, unexpired) refresh-token
-    sessions, so the client can render 'Active Devices & Sessions'."""
+    sessions, so the client can render 'Active Devices & Sessions'.
+    `is_current` marks the device making the call (ask 9)."""
+    current_sid = getattr(request.state, "session_id", None) if request else None
     now = datetime.now(timezone.utc)
     sessions = await UserSession.find(
         {"user.$id": current_user.id, "is_revoked": False, "expires_at": {"$gt": now}}
@@ -743,6 +868,8 @@ async def list_sessions(current_user: User = Depends(get_current_user)):
     return [
         SessionResponse(
             id=str(s.id),
+            session_id=s.family_id,
+            is_current=s.family_id == current_sid,
             user_agent=s.user_agent,
             ip_address=s.ip_address,
             created_at=s.created_at,
@@ -767,8 +894,9 @@ async def revoke_session(session_id: str, current_user: User = Depends(get_curre
     if not session or str(session_owner_id) != str(current_user.id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
 
-    session.is_revoked = True
-    await session.save()
+    await UserSession.find({"family_id": session.family_id, "is_revoked": False}).update(
+        {"$set": {"is_revoked": True, "revoked_reason": "signed_out"}}
+    )
     return {"detail": "Session revoked."}
 
 
@@ -780,7 +908,14 @@ async def revoke_session(session_id: str, current_user: User = Depends(get_curre
 async def freeze_me(current_user: User = Depends(get_current_user)):
     """Pause the account: drops any artisan profile out of search and
     blocks new bookings, but — unlike /deactivate-me — login still works,
-    which is how the user reverses this via /unfreeze-me."""
+    which is how the user reverses this via /unfreeze-me.
+
+    While frozen, every endpoint that changes data answers 423
+    `account_frozen` except sign-in, refresh, password change, session
+    management, sign-out and /unfreeze-me (ask 17). Applies to every role.
+    """
+    if current_user.is_paused:
+        raise APIError(status.HTTP_409_CONFLICT, "Your account is already frozen.", code="already_frozen")
     current_user.is_paused = True
     await current_user.save()
 
@@ -793,6 +928,8 @@ async def freeze_me(current_user: User = Depends(get_current_user)):
 
 @router.post("/unfreeze-me", status_code=status.HTTP_200_OK)
 async def unfreeze_me(current_user: User = Depends(get_current_user)):
+    if not current_user.is_paused:
+        raise APIError(status.HTTP_409_CONFLICT, "Your account isn't frozen.", code="not_frozen")
     current_user.is_paused = False
     await current_user.save()
 

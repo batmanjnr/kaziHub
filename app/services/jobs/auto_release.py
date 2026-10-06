@@ -18,38 +18,17 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from app.models.booking import Booking, BookingStatus, EscrowStatus
-from app.models.notification import Notification
-from app.models.transaction import Transaction, TransactionStatus, TransactionType
-from app.models.user import User
-from app.services.booking_transitions import apply_booking_transition
-from app.services.payouts import request_artisan_payout
+from app.services.notifications import naira, notify_booking_party
+from app.services.payouts import PayoutError, release_escrow_with_payout
 
 logger = logging.getLogger("kazihub.jobs.auto_release")
 
 
 async def _release_one(booking: Booking) -> None:
-    artisan_id = booking.artisan.ref.id if hasattr(booking.artisan, "ref") else booking.artisan.id
-    payout_amount = booking.artisan_earnings or booking.amount
-    payout_result = await request_artisan_payout(
-        artisan_id, payout_amount, reason=f"Auto-release for booking {booking.id}"
-    )
-    if payout_result["status"] != "pending":
-        raise RuntimeError(
-            f"Payout could not be initiated: {payout_result['gateway_response'].get('error')}"
-        )
-
-    async def _writes(b, session) -> None:
-        await Transaction(
-            booking=b,
-            transaction_reference=payout_result["reference"],
-            amount=payout_amount,
-            type=TransactionType.ESCROW_RELEASE,
-            status=TransactionStatus.PENDING,
-            gateway_response=payout_result["gateway_response"],
-        ).insert(session=session)
-
-    updated = await apply_booking_transition(
-        booking.id,
+    updated = await release_escrow_with_payout(
+        booking,
+        payout_amount=booking.artisan_earnings or booking.amount,
+        payout_reason=f"Auto-release for booking {booking.id}",
         allowed_statuses=[BookingStatus.COMPLETED_BY_ARTISAN],
         allowed_escrow_statuses=[EscrowStatus.HELD_IN_ESCROW],
         updates={
@@ -58,19 +37,16 @@ async def _release_one(booking: Booking) -> None:
         },
         to_status=BookingStatus.PAID_OUT,
         reason="Auto-released after 4-day window with no dispute",
-        extra_writes=_writes,
     )
 
-    client_id = updated.client.ref.id if hasattr(updated.client, "ref") else updated.client.id
-    client = await User.get(client_id)
-    if client:
-        await Notification(
-            user=client,
-            type="escrow_auto_released",
-            title="Job auto-completed",
-            message="Your booking was automatically marked complete and payment released to the artisan.",
-            booking=updated,
-        ).insert()
+    await notify_booking_party(
+        updated, "client", "escrow_auto_released", "Job auto-completed",
+        f"'{updated.title}' was automatically confirmed after 4 days and payment released to the artisan.",
+    )
+    await notify_booking_party(
+        updated, "artisan", "payment_released", "Payment released",
+        f"{naira(updated.artisan_earnings or updated.amount)} for '{updated.title}' is on its way to your bank account.",
+    )
 
 
 async def run_auto_release() -> dict:
@@ -78,6 +54,7 @@ async def run_auto_release() -> dict:
     candidates = await Booking.find(
         {
             "status": BookingStatus.COMPLETED_BY_ARTISAN.value,
+            "escrow_status": EscrowStatus.HELD_IN_ESCROW.value,
             "auto_completion_deadline": {"$lte": now},
         }
     ).to_list()
@@ -87,18 +64,18 @@ async def run_auto_release() -> dict:
         try:
             await _release_one(booking)
             released += 1
+        except PayoutError as e:
+            # Payout couldn't be initiated (e.g. no verified bank account);
+            # the booking was left/restored as completed_by_artisan for an
+            # admin to resolve — never marked paid out with no money behind it.
+            logger.warning("auto-release payout failed for booking=%s: %s", booking.id, e.detail)
+            failed += 1
         except HTTPException:
             # Lost the optimistic-lock race, or the booking no longer
             # qualifies by the time we tried to write (e.g. a dispute won
             # first) — skip, not an error. Picked up again next run if it
             # still qualifies.
             skipped += 1
-        except RuntimeError as e:
-            # Payout couldn't even be initiated (e.g. no verified bank
-            # account) — leave the booking as-is for an admin to resolve
-            # manually; don't mark it paid out with no money behind it.
-            logger.warning("auto-release payout failed for booking=%s: %s", booking.id, e)
-            failed += 1
 
     return {
         "candidates": len(candidates),

@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     PII_ENCRYPTION_KEY: str = ""
 
     PAYSTACK_SECRET_KEY: str = ""
+    # Frontend page Paystack redirects to after checkout, e.g.
+    # https://app.kazihub.com/payments/callback (ask 25). The backend adds
+    # ?booking_id=...; Paystack adds &reference=...&trxref=....
+    PAYSTACK_CALLBACK_URL: str = ""
+
+    # Optional inbox that receives a copy of each new support ticket.
+    SUPPORT_EMAIL: str = ""
 
     # FIX (high-assurance security review): previously kyc_upload_token.py
     # signed its tokens with SECRET_KEY — the same secret used to sign JWTs.
@@ -45,6 +52,17 @@ class Settings(BaseSettings):
     # catch a second registration — but the hash can't be reversed back to
     # the NIN. Its own dedicated key, same reasoning as KYC_UPLOAD_TOKEN_SECRET.
     NIN_HASH_KEY: str = ""
+
+    # Set True only when the app sits behind a reverse proxy/load balancer
+    # that sets X-Forwarded-For. Otherwise every request appears to come
+    # from the proxy's IP and all users share one rate-limit bucket. Left
+    # False by default because a client can forge the header when there's
+    # no proxy in front to overwrite it.
+    TRUST_PROXY_HEADERS: bool = False
+
+    # Baseline per-IP request budget across the whole API (spec §3). Raise
+    # it temporarily for a load test run from a single machine.
+    GLOBAL_RATE_LIMIT_PER_MINUTE: int = 100
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

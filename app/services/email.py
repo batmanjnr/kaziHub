@@ -81,3 +81,43 @@ def send_password_reset_email(to_email: str, otp: str) -> None:
 
     except Exception as e:
         logger.error(f"Failed to send password reset email to {to_email}: {e}")
+
+def _send(to_email: str, subject: str, body: str) -> None:
+    msg = MIMEMultipart()
+    msg["From"] = settings.EMAILS_FROM_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+        server.starttls()
+        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        server.sendmail(settings.EMAILS_FROM_EMAIL, to_email, msg.as_string())
+
+
+def send_support_ticket_email(
+    to_email: str, ticket_number: str, from_user: str, subject: str, message: str, booking_id
+) -> None:
+    """Copy of a new support ticket to the support inbox (ask 14)."""
+    try:
+        body = (
+            f"Ticket: {ticket_number}\nFrom: {from_user}\n"
+            f"Booking: {booking_id or '-'}\n\n{message}"
+        )
+        _send(to_email, f"[{ticket_number}] {subject}", body)
+    except Exception as e:
+        logger.error(f"Failed to send support ticket {ticket_number} email: {e}")
+
+
+def send_notification_summary_email(to_email: str, first_name: str, lines: list) -> bool:
+    """Daily summary of unread notifications (ask 12)."""
+    try:
+        body = (
+            f"Hi {first_name},\n\nHere's what you missed on KaziHub:\n\n"
+            + "\n".join(f"- {line}" for line in lines)
+            + "\n\nOpen the app to see more. You can turn these emails off in Settings."
+        )
+        _send(to_email, "Your KaziHub summary", body)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send summary email to {to_email}: {e}")
+        return False

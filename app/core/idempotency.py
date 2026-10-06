@@ -8,14 +8,23 @@ fund-escrow, confirm-completion, dispute, admin refund/release) depend on
 """
 from typing import Optional
 
-from fastapi import HTTPException, Request, status
+from fastapi import Header, HTTPException, status
 
 from app.models.idempotency_key import IdempotencyRecord
 from app.models.user import User
 
 
-async def require_idempotency_key(request: Request) -> str:
-    key = request.headers.get("Idempotency-Key")
+async def require_idempotency_key(
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        description="A fresh unique value (e.g. a UUID) per user action. Retrying with the same key "
+        "returns the first response instead of repeating the action.",
+        min_length=1,
+        max_length=200,
+    ),
+) -> str:
+    key = idempotency_key.strip()
     if not key:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

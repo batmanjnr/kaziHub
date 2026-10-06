@@ -2,6 +2,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 from beanie import Document, Link
+from app.core.time import utc_now
+from pydantic import Field
 from app.models.booking import Booking
 
 
@@ -32,7 +34,7 @@ class Transaction(Document):
     type: TransactionType
     status: TransactionStatus = TransactionStatus.PENDING
     gateway_response: Optional[dict] = None
-    created_at: datetime = datetime.utcnow()
+    created_at: datetime = Field(default_factory=utc_now)
 
     class Settings:
         name = "escrow_transactions"

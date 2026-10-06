@@ -6,7 +6,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from app.api.deps import get_own_artisan_profile
 from app.core.cloudinary import delete_file_from_cloudinary, upload_file_to_cloudinary
 from app.core.upload_validation import IMAGE_TYPES, validate_upload
-from app.models.portfolio import PortfolioItem, PortfolioItemCreate, PortfolioItemResponse
+from app.models.portfolio import (
+    PortfolioItem,
+    PortfolioItemCreate,
+    PortfolioItemResponse,
+    PortfolioItemUpdate,
+)
+from app.models.uploads import UploadUrlResponse
 from app.models.profile import Profile
 from app.services.moderation import moderate_image
 
@@ -31,12 +37,14 @@ def build_portfolio_response(item: PortfolioItem) -> PortfolioItemResponse:
     )
 
 
-@router.post("/upload")
+@router.post("/upload", response_model=UploadUrlResponse)
 async def upload_portfolio_image(
     file: UploadFile = File(...),
     profile: Profile = Depends(get_own_artisan_profile),
 ):
-    """Upload a portfolio image to Cloudinary (Artisans only)."""
+    """Upload a portfolio image (Artisans only). Multipart, one `file`
+    field: JPEG, PNG or WebP, up to 10 MB. Returns {"url": ...} to send as
+    `image_url` when creating or editing a portfolio item."""
     await validate_upload(file, allowed_types=IMAGE_TYPES)
     secure_url = await upload_file_to_cloudinary(file, folder="kazihub/portfolio")
     if not await moderate_image(secure_url):
@@ -64,6 +72,47 @@ async def list_my_portfolio(profile: Profile = Depends(get_own_artisan_profile))
     """List the logged-in artisan's own portfolio items."""
     items = await PortfolioItem.find({"artisan_profile.$id": profile.id}).to_list()
     return [build_portfolio_response(i) for i in items]
+
+
+async def _load_own_item(item_id: str, profile: Profile) -> PortfolioItem:
+    try:
+        item = await PortfolioItem.get(PydanticObjectId(item_id))
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid portfolio item ID.")
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Portfolio item not found")
+    artisan_profile_id = (
+        item.artisan_profile.ref.id if hasattr(item.artisan_profile, "ref") else item.artisan_profile.id
+    )
+    if artisan_profile_id != profile.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only manage your own portfolio items",
+        )
+    return item
+
+
+@router.patch("/{item_id}", response_model=PortfolioItemResponse)
+async def update_portfolio_item(
+    item_id: str,
+    item_in: PortfolioItemUpdate,
+    profile: Profile = Depends(get_own_artisan_profile),
+):
+    """Edit any subset of a portfolio item's fields, keeping its id and
+    created_at (ask 7). Replacing image_url deletes the old Cloudinary
+    image."""
+    item = await _load_own_item(item_id, profile)
+    update_data = item_in.model_dump(exclude_unset=True)
+    old_image = item.image_url
+    if update_data:
+        await item.set(update_data)
+    new_image = update_data.get("image_url")
+    if new_image and new_image != old_image and old_image and "cloudinary.com" in old_image:
+        try:
+            await delete_file_from_cloudinary(old_image)
+        except Exception:
+            pass
+    return build_portfolio_response(item)
 
 
 @router.delete("/{item_id}", status_code=status.HTTP_200_OK)

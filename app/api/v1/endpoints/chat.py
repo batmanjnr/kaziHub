@@ -1,18 +1,23 @@
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import datetime
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from bson import ObjectId
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from app.api.deps import get_current_user
-from app.core.cloudinary import delete_file_from_cloudinary, upload_file_to_cloudinary
-from app.core.upload_validation import CHAT_MEDIA_TYPES, IMAGE_TYPES, validate_upload
+from app.core.cloudinary import delete_file_from_cloudinary, upload_audio_to_cloudinary, upload_file_to_cloudinary
+from app.core.errors import APIError
+from app.core.time import as_utc, utc_now
+from app.core.upload_validation import AUDIO_TYPES, CHAT_MEDIA_TYPES, IMAGE_TYPES, VIDEO_TYPES, validate_upload
 from app.core.websocket_manager import manager
-from app.core.ws_ticket import ws_ticket_store
+from app.core.ws_ticket import TICKET_TTL_SECONDS, ws_ticket_store
 from app.models.chat import Conversation, Message, MessageCreate, MessageResponse
+from app.models.profile import Profile
+from app.models.uploads import ChatUploadResponse
 from app.models.user import User
 from app.services.moderation import moderate_image
+from app.services.notifications import notify
 
 # WebSocket + media-upload utility endpoints, mounted under /chat.
 router = APIRouter()
@@ -21,7 +26,30 @@ conversations_router = APIRouter()
 
 
 class StartConversationSchema(BaseModel):
+    artisan_id: str = Field(description="The artisan's user id (a profile's `user_id`).")
+
+
+class ConversationResponse(BaseModel):
+    id: str
+    client_id: str
     artisan_id: str
+    client_name: Optional[str] = None
+    client_avatar: Optional[str] = None
+    artisan_name: Optional[str] = None
+    artisan_avatar: Optional[str] = None
+    artisan_profile_id: Optional[str] = None
+    active_booking_id: Optional[str] = None
+    active_job_title: Optional[str] = None
+    active_job_amount: Optional[float] = None
+    last_message: Optional[str] = None
+    unread_count: int = 0
+    updated_at: datetime
+
+
+class WsTicketResponse(BaseModel):
+    ticket: str = Field(description="Single-use; pass as `?ticket=` when opening the socket.")
+    expires_in: int = Field(description="Seconds until the ticket expires if unused.")
+    websocket_path: str = Field(description="Path to open, with {conversation_id} filled in by you.")
 
 
 def extract_user_id(user_link) -> str:
@@ -73,10 +101,10 @@ def _assert_participant(conv: Conversation, user: User) -> None:
         raise HTTPException(status_code=403, detail="Not authorized.")
 
 
-def _other_participant_id(conv: Conversation, user: User) -> str:
+def _other_participant_id(conv: Conversation, user_id: str) -> str:
     c_id = extract_user_id(conv.client)
     a_id = extract_user_id(conv.artisan)
-    return a_id if str(user.id) == c_id else c_id
+    return a_id if user_id == c_id else c_id
 
 
 async def mark_conversation_read(conversation_id: str, reader_id: str) -> None:
@@ -88,19 +116,145 @@ async def mark_conversation_read(conversation_id: str, reader_id: str) -> None:
             "sender_id": {"$ne": reader_id},
             "status": {"$ne": "read"},
         }
-    ).update({"$set": {"status": "read", "read_at": datetime.now(timezone.utc)}})
+    ).update({"$set": {"status": "read", "read_at": utc_now()}})
+
+
+async def _conversation_responses(conversations: List[Conversation], viewer_id: str) -> List[ConversationResponse]:
+    """Names and avatars for both people (ask 29), one query each for users
+    and artisan profiles."""
+    user_ids = set()
+    for c in conversations:
+        user_ids.add(ObjectId(extract_user_id(c.client)))
+        user_ids.add(ObjectId(extract_user_id(c.artisan)))
+    users: Dict[str, User] = {
+        str(u.id): u for u in await User.find({"_id": {"$in": list(user_ids)}}).to_list()
+    }
+    artisan_ids = [ObjectId(extract_user_id(c.artisan)) for c in conversations]
+    profiles = {
+        extract_user_id(p.user): p
+        for p in await Profile.find({"user.$id": {"$in": artisan_ids}}).to_list()
+    }
+
+    out = []
+    for c in conversations:
+        c_id, a_id = extract_user_id(c.client), extract_user_id(c.artisan)
+        client, artisan, profile = users.get(c_id), users.get(a_id), profiles.get(a_id)
+        unread_query = {"conversation_id": str(c.id), "sender_id": {"$ne": viewer_id}, "status": {"$ne": "read"}}
+        cleared = c.cleared_at.get(viewer_id)
+        if cleared:
+            unread_query["created_at"] = {"$gt": cleared}
+        out.append(
+            ConversationResponse(
+                id=str(c.id),
+                client_id=c_id,
+                artisan_id=a_id,
+                client_name=f"{client.first_name} {client.last_name}" if client else None,
+                client_avatar=client.profile_picture if client else None,
+                artisan_name=f"{artisan.first_name} {artisan.last_name}" if artisan else None,
+                artisan_avatar=artisan.profile_picture if artisan else None,
+                artisan_profile_id=str(profile.id) if profile else None,
+                active_booking_id=c.active_booking_id,
+                active_job_title=c.active_job_title,
+                active_job_amount=c.active_job_amount,
+                last_message=c.last_message,
+                unread_count=await Message.find(unread_query).count(),
+                updated_at=c.updated_at,
+            )
+        )
+    return out
+
+
+async def send_chat_message(conv: Conversation, sender_id: str, data: MessageCreate) -> Message:
+    """The one send path for REST and the WebSocket.
+
+    Refuses if either person's account is frozen (ask 17), stores the
+    message, un-hides the conversation for both people (ask 36), broadcasts
+    it, and then either reports it delivered (recipient has the chat open
+    live) or notifies the recipient (ask 31).
+    """
+    conversation_id = str(conv.id)
+    recipient_id = _other_participant_id(conv, sender_id)
+    sender = await User.get(ObjectId(sender_id))
+    recipient = await User.get(ObjectId(recipient_id))
+    if sender and sender.is_paused:
+        raise APIError(status.HTTP_423_LOCKED, "Your account is frozen.", code="account_frozen")
+    if recipient is None or recipient.is_paused or recipient.deleted_at is not None:
+        raise APIError(
+            status.HTTP_423_LOCKED,
+            "This person isn't receiving messages right now.",
+            code="recipient_unavailable",
+        )
+    if not (data.content or data.attachments or data.audio_url or data.location_data):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A message needs content, an attachment, audio or a location.")
+
+    msg = Message(
+        conversation_id=conversation_id,
+        sender_id=sender_id,
+        recipient_id=recipient_id,
+        content=data.content,
+        attachments=data.attachments,
+        audio_url=data.audio_url,
+        media_type=data.media_type,
+        audio_duration=data.audio_duration,
+        audio_wave_data=data.audio_wave_data,
+        location_data=data.location_data,
+        message_type=data.message_type,
+        status="sent",
+    )
+    await msg.insert()
+
+    conv.last_message = data.content or f"[{data.message_type}]"
+    conv.updated_at = msg.created_at
+    conv.hidden_for = []
+    await conv.save()
+
+    await manager.broadcast_to_conversation(conversation_id, {
+        "event": "new_message",
+        "message": build_message_response(msg).model_dump(mode="json"),
+    })
+
+    if manager.is_user_connected(conversation_id, recipient_id):
+        msg.status = "delivered"
+        await msg.save()
+        await manager.broadcast_to_conversation(conversation_id, {
+            "event": "message_delivered",
+            "conversation_id": conversation_id,
+            "message_id": str(msg.id),
+        })
+    else:
+        preview = (data.content or "").strip()
+        if not preview:
+            preview = {"image": "Sent a photo", "audio": "Sent a voice note", "voice": "Sent a voice note",
+                       "video": "Sent a video", "location": "Shared a location"}.get(data.message_type, "Sent a message")
+        await notify(
+            recipient,
+            "new_message",
+            f"New message from {sender.first_name}" if sender else "New message",
+            preview[:140],
+        )
+    return msg
 
 
 # ---------------------------------------------------------
 # WS AUTH TICKET (spec §5.4/§10 fix)
 # ---------------------------------------------------------
-@router.post("/ws-ticket")
+@router.post("/ws-ticket", response_model=WsTicketResponse)
 async def issue_ws_ticket(current_user: User = Depends(get_current_user)):
-    """Issue a one-time, short-lived ticket for the WS handshake below,
-    fetched via this authenticated REST call rather than ever putting the
-    real access token in a WS query string."""
+    """Issue a one-time ticket for opening the chat WebSocket (ask 32).
+
+    The ticket is single-use and expires after 30 seconds, so fetch a new
+    one for every (re)connect. Open:
+
+        wss://<api-host>/api/v1/chat/ws/{conversation_id}?ticket={ticket}
+
+    See the WebSocket section of docs/FRONTEND_API_NOTES.md for every event.
+    """
     ticket = ws_ticket_store.issue(str(current_user.id))
-    return {"ticket": ticket, "expires_in": 30}
+    return WsTicketResponse(
+        ticket=ticket,
+        expires_in=TICKET_TTL_SECONDS,
+        websocket_path="/api/v1/chat/ws/{conversation_id}?ticket={ticket}",
+    )
 
 
 # ---------------------------------------------------------
@@ -109,10 +263,28 @@ async def issue_ws_ticket(current_user: User = Depends(get_current_user)):
 @router.websocket("/ws/{conversation_id}")
 async def websocket_chat_endpoint(websocket: WebSocket, conversation_id: str, ticket: str):
     """
-    WebSocket endpoint for real-time live messaging.
-    Connect via: ws://localhost:8000/api/v1/chat/ws/{conversation_id}?ticket={one_time_ticket}
-    Fetch the ticket first via POST /api/v1/chat/ws-ticket (an authenticated
-    REST call) — never pass a long-lived access token here (spec §5.4/§10).
+    Live chat for one conversation. FastAPI doesn't list WebSocket routes in
+    /openapi.json; the protocol is documented in docs/FRONTEND_API_NOTES.md.
+
+    Connect: wss://<host>/api/v1/chat/ws/{conversation_id}?ticket=<from POST /chat/ws-ticket>
+    A bad/expired ticket, unknown conversation, or non-participant is
+    closed with code 1008 before accepting.
+
+    Client -> server (JSON):
+      {"action": "send", ...MessageCreate fields}   (the "action" key may be omitted)
+      {"action": "mark_read"}
+      {"action": "typing", "is_typing": true|false}
+      {"action": "ping"}
+
+    Server -> client (JSON, all carry "event"):
+      new_message        {"message": MessageResponse}
+      message_delivered  {"conversation_id", "message_id"}
+      messages_read      {"conversation_id", "reader_id"}
+      typing             {"conversation_id", "user_id", "is_typing"}
+      pong               {}
+      error              {"code", "detail"}  (connection stays open)
+      plus booking events: booking_updated, quote_received, quote_accepted,
+      escrow_funded, escrow_released, booking_status_changed.
     """
     user_id = ws_ticket_store.redeem(ticket)
     if not user_id:
@@ -135,13 +307,31 @@ async def websocket_chat_endpoint(websocket: WebSocket, conversation_id: str, ti
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    await manager.connect(conversation_id, websocket)
+    await manager.connect(conversation_id, websocket, user_id)
+
+    async def send_error(code: str, detail) -> None:
+        await websocket.send_json({"event": "error", "code": code, "detail": detail})
 
     try:
         while True:
-            raw_data = await websocket.receive_json()
+            try:
+                raw_data = await websocket.receive_json()
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                await send_error("invalid_json", "Send JSON objects only.")
+                continue
+            if not isinstance(raw_data, dict):
+                await send_error("invalid_json", "Send JSON objects only.")
+                continue
 
-            if raw_data.get("action") == "mark_read":
+            action = raw_data.pop("action", "send")
+
+            if action == "ping":
+                await websocket.send_json({"event": "pong"})
+                continue
+
+            if action == "mark_read":
                 await mark_conversation_read(conversation_id, user_id)
                 await manager.broadcast_to_conversation(conversation_id, {
                     "event": "messages_read",
@@ -150,69 +340,82 @@ async def websocket_chat_endpoint(websocket: WebSocket, conversation_id: str, ti
                 })
                 continue
 
-            data = MessageCreate.model_validate(raw_data)
+            if action == "typing":
+                await manager.broadcast_to_conversation(conversation_id, {
+                    "event": "typing",
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "is_typing": bool(raw_data.get("is_typing", True)),
+                }, exclude=websocket)
+                continue
 
-            msg = Message(
-                conversation_id=conversation_id,
-                sender_id=user_id,
-                recipient_id=a_id if user_id == c_id else c_id,
-                content=data.content,
-                attachments=data.attachments,
-                audio_url=data.audio_url,
-                media_type=data.media_type,
-                audio_duration=data.audio_duration,
-                audio_wave_data=data.audio_wave_data,
-                location_data=data.location_data,
-                message_type=data.message_type,
-                status="sent",
-            )
-            await msg.insert()
+            if action != "send":
+                await send_error("unknown_action", f"Unknown action '{action}'.")
+                continue
 
-            conv.last_message = data.content or f"[{data.message_type} attachment]"
-            conv.updated_at = msg.created_at
-            await conv.save()
+            try:
+                data = MessageCreate.model_validate(raw_data)
+            except ValidationError as e:
+                await send_error("validation_error", e.errors(include_url=False, include_context=False))
+                continue
 
-            await manager.broadcast_to_conversation(conversation_id, {
-                "event": "new_message",
-                "message": build_message_response(msg).model_dump(mode="json"),
-            })
+            conv = await Conversation.get(conv.id)
+            try:
+                await send_chat_message(conv, user_id, data)
+            except APIError as e:
+                await send_error(e.code, e.detail)
+            except HTTPException as e:
+                await send_error("rejected", e.detail)
 
     except WebSocketDisconnect:
+        pass
+    finally:
         manager.disconnect(conversation_id, websocket)
 
 
 # ---------------------------------------------------------
 # CHAT MEDIA UPLOAD
 # ---------------------------------------------------------
-@router.post("/upload-media")
+@router.post("/upload-media", response_model=ChatUploadResponse)
 async def upload_chat_media(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
 ):
-    """Upload a photo or audio voice note for chat to Cloudinary.
+    """Upload a photo, short video or voice note for chat (asks 15, 39).
 
-    FIX: this used to delete every prior attachment/audio_url in the entire
-    conversation on every new upload, destroying chat history — that logic
-    is removed. Uploading media does not touch any existing message.
+    Multipart, one `file` field. Accepted:
+      - images: image/jpeg, image/png, image/webp — up to 10 MB
+      - video: video/mp4 — up to 50 MB
+      - audio: audio/webm, audio/wav, audio/mp4, audio/x-m4a, audio/m4a,
+        audio/aac — up to 15 MB
+
+    Voice notes come back as an AAC .m4a `url` that plays on every device
+    (Safari's audio/mp4 recording can be uploaded as is). Then send a
+    message with `attachments: [url]` (photo/video) or `audio_url: url`.
     """
-    await validate_upload(file, allowed_types=CHAT_MEDIA_TYPES)
+    content_type = await validate_upload(file, allowed_types=CHAT_MEDIA_TYPES)
+
+    if content_type in AUDIO_TYPES:
+        result = await upload_audio_to_cloudinary(file, folder="kazihub/chat")
+        return ChatUploadResponse(url=result["url"], media_type="audio", original_url=result["original_url"])
+
     secure_url = await upload_file_to_cloudinary(file, folder="kazihub/chat")
 
     # Only images get the NSFW/illegal-content screen — voice notes and
     # short clips aren't in scope for an image classifier (spec §9).
-    if file.content_type in IMAGE_TYPES and not await moderate_image(secure_url):
+    if content_type in IMAGE_TYPES and not await moderate_image(secure_url):
         await delete_file_from_cloudinary(secure_url)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This image did not pass content moderation.",
         )
-    return {"url": secure_url}
+    return ChatUploadResponse(url=secure_url, media_type="video" if content_type in VIDEO_TYPES else "image")
 
 
 # ---------------------------------------------------------
 # REST ENDPOINTS FOR CONVERSATIONS & CHAT HISTORY (spec §5.4)
 # ---------------------------------------------------------
-@conversations_router.post("")
+@conversations_router.post("", response_model=ConversationResponse)
 async def start_or_get_conversation(
     payload: StartConversationSchema,
     current_user: User = Depends(get_current_user),
@@ -238,6 +441,11 @@ async def start_or_get_conversation(
             detail="You cannot start a conversation with yourself."
         )
 
+    if artisan.is_paused:
+        raise APIError(
+            status.HTTP_423_LOCKED, "This person isn't receiving messages right now.", code="recipient_unavailable"
+        )
+
     # Standard MongoDB DBRef $id query (avoids aggregation pipeline)
     conv = await Conversation.find_one({
         "client.$id": current_user.id,
@@ -247,49 +455,52 @@ async def start_or_get_conversation(
     if not conv:
         conv = Conversation(client=current_user, artisan=artisan)
         await conv.insert()
+    elif str(current_user.id) in conv.hidden_for:
+        conv.hidden_for = [u for u in conv.hidden_for if u != str(current_user.id)]
+        await conv.save()
 
-    return {
-        "id": str(conv.id),
-        "client_id": extract_user_id(conv.client),
-        "artisan_id": extract_user_id(conv.artisan),
-        "active_booking_id": conv.active_booking_id,
-        "active_job_title": conv.active_job_title,
-        "active_job_amount": conv.active_job_amount,
-        "last_message": conv.last_message,
-        "updated_at": conv.updated_at,
-    }
+    return (await _conversation_responses([conv], str(current_user.id)))[0]
 
 
-@conversations_router.get("")
+@conversations_router.get("", response_model=List[ConversationResponse])
 async def get_my_conversations(
     # FIX (security review): previously unbounded.
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(get_current_user),
 ):
-    """Fetch user's inbox list."""
+    """Fetch user's inbox list, newest first, with both people's names and
+    avatars. Conversations the caller deleted are left out until a new
+    message arrives."""
     conversations = (
         await Conversation.find({
             "$or": [
                 {"client.$id": current_user.id},
                 {"artisan.$id": current_user.id}
-            ]
+            ],
+            "hidden_for": {"$ne": str(current_user.id)},
         }).sort("-updated_at").skip(offset).limit(limit).to_list()
     )
+    return await _conversation_responses(conversations, str(current_user.id))
 
-    return [
-        {
-            "id": str(c.id),
-            "client_id": extract_user_id(c.client),
-            "artisan_id": extract_user_id(c.artisan),
-            "active_booking_id": c.active_booking_id,
-            "active_job_title": c.active_job_title,
-            "active_job_amount": c.active_job_amount,
-            "last_message": c.last_message,
-            "updated_at": c.updated_at,
-        }
-        for c in conversations
-    ]
+
+@conversations_router.delete("/{conversation_id}", status_code=status.HTTP_200_OK)
+async def delete_conversation(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a conversation for the caller only (ask 36). It leaves their
+    inbox and its current messages are cleared for them for good; the
+    other person keeps their copy. A new message brings the conversation
+    back, showing only messages from then on."""
+    conv = await _load_conversation_or_404(conversation_id)
+    _assert_participant(conv, current_user)
+    me = str(current_user.id)
+    if me not in conv.hidden_for:
+        conv.hidden_for.append(me)
+    conv.cleared_at[me] = utc_now()
+    await conv.save()
+    return {"detail": "Conversation deleted."}
 
 
 @conversations_router.get("/{conversation_id}/messages", response_model=List[MessageResponse])
@@ -297,11 +508,18 @@ async def get_conversation_messages(
     conversation_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Retrieve message history for a conversation."""
+    """Message history, oldest first (ask 35). Messages from before the
+    caller last deleted this conversation are left out."""
     conv = await _load_conversation_or_404(conversation_id)
     _assert_participant(conv, current_user)
 
-    messages = await Message.find(Message.conversation_id == conversation_id).sort("created_at").to_list()
+    query: dict = {"conversation_id": conversation_id}
+    cleared = conv.cleared_at.get(str(current_user.id))
+    if cleared:
+        query["created_at"] = {"$gt": as_utc(cleared)}
+    # _id breaks ties: older rows saved before the timestamp fix share one
+    # created_at, and _id still preserves their real order.
+    messages = await Message.find(query).sort([("created_at", 1), ("_id", 1)]).to_list()
     return [build_message_response(m) for m in messages]
 
 
@@ -314,35 +532,14 @@ async def send_message(
     current_user: User = Depends(get_current_user),
 ):
     """Send a message via REST (in addition to the WS channel — useful when
-    the client isn't currently connected over the socket)."""
+    the client isn't currently connected over the socket). `message_type`
+    must be one of text, image, audio, voice, video, location (422
+    otherwise). 423 `recipient_unavailable` if the other person's account
+    is frozen."""
     conv = await _load_conversation_or_404(conversation_id)
     _assert_participant(conv, current_user)
 
-    msg = Message(
-        conversation_id=conversation_id,
-        sender_id=str(current_user.id),
-        recipient_id=_other_participant_id(conv, current_user),
-        content=payload.content,
-        attachments=payload.attachments,
-        audio_url=payload.audio_url,
-        media_type=payload.media_type,
-        audio_duration=payload.audio_duration,
-        audio_wave_data=payload.audio_wave_data,
-        location_data=payload.location_data,
-        message_type=payload.message_type,
-        status="sent",
-    )
-    await msg.insert()
-
-    conv.last_message = payload.content or f"[{payload.message_type} attachment]"
-    conv.updated_at = msg.created_at
-    await conv.save()
-
-    await manager.broadcast_to_conversation(conversation_id, {
-        "event": "new_message",
-        "message": build_message_response(msg).model_dump(mode="json"),
-    })
-
+    msg = await send_chat_message(conv, str(current_user.id), payload)
     return build_message_response(msg)
 
 

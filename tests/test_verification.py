@@ -69,7 +69,7 @@ async def test_submit_requires_biometric_consent():
 async def test_review_approval_writes_audit_log_and_notification_and_verifies_profile():
     applicant = await make_user("kyc2@example.com")
     admin = await make_user("admin1@example.com", is_admin=True)
-    profile = Profile(user=applicant, category="plumbing", state="Lagos")
+    profile = Profile(user=applicant, category="Plumbers", state="Lagos")
     await profile.insert()
 
     submitted = await submit_verification(
@@ -99,7 +99,7 @@ async def test_review_approval_writes_audit_log_and_notification_and_verifies_pr
 async def test_review_rejection_does_not_verify_profile_but_still_logs():
     applicant = await make_user("kyc3@example.com")
     admin = await make_user("admin2@example.com", is_admin=True)
-    profile = Profile(user=applicant, category="plumbing", state="Lagos")
+    profile = Profile(user=applicant, category="Plumbers", state="Lagos")
     await profile.insert()
 
     submitted = await submit_verification(
@@ -155,7 +155,7 @@ async def test_verification_queue_lists_pending_only():
             doc_public_id="kazihub/verifications/id-b",
             selfie_public_id="kazihub/verifications/selfie-b",
             document_type="passport",
-            document_number="20202020202",
+            document_number="A12345678",
         ),
         current_user=applicant2,
     )

@@ -21,6 +21,8 @@ class PendingUser(Document):
     otp_code: str
     otp_expires_at: datetime
     otp_attempts: int = 0
+    terms_version: Optional[str] = None
+    terms_accepted_at: Optional[datetime] = None
     created_at: datetime
 
     class Settings:

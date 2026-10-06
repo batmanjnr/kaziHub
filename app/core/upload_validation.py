@@ -10,7 +10,9 @@ from fastapi import HTTPException, UploadFile, status
 
 IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp")
 VIDEO_TYPES = ("video/mp4",)
-AUDIO_TYPES = ("audio/webm", "audio/wav")
+# audio/mp4 (+ m4a/aac aliases) is what Safari, and so every iPhone
+# browser, records (ask 39).
+AUDIO_TYPES = ("audio/webm", "audio/wav", "audio/mp4", "audio/x-m4a", "audio/m4a", "audio/aac")
 CHAT_MEDIA_TYPES = IMAGE_TYPES + VIDEO_TYPES + AUDIO_TYPES
 
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024   # 10 MB
@@ -30,17 +32,19 @@ async def validate_upload(
     file: UploadFile,
     allowed_types: Sequence[str] = IMAGE_TYPES,
     max_size_bytes: Optional[int] = None,
-) -> None:
+) -> str:
     """Raises 400 if `file` isn't an allowed content-type or exceeds the
     size limit. Call this before the file is handed to any storage
-    provider."""
-    if file.content_type not in allowed_types:
+    provider. Returns the content type without parameters."""
+    # Browsers often add parameters, e.g. "audio/webm;codecs=opus".
+    base_type = (file.content_type or "").split(";")[0].strip().lower()
+    if base_type not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file type '{file.content_type}'. Allowed: {list(allowed_types)}",
         )
 
-    limit = max_size_bytes or _default_max_size(file.content_type)
+    limit = max_size_bytes or _default_max_size(base_type)
 
     size = file.size
     if size is None:
@@ -55,3 +59,4 @@ async def validate_upload(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"File too large ({size} bytes). Max allowed: {limit} bytes.",
         )
+    return base_type

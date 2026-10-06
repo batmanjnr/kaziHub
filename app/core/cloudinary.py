@@ -36,6 +36,25 @@ async def upload_file_to_cloudinary(file: UploadFile, folder: str) -> str:
     
     return response["secure_url"]
 
+async def upload_audio_to_cloudinary(file: UploadFile, folder: str) -> dict:
+    """Uploads a voice note as-is and returns both its original URL and an
+    AAC/.m4a delivery URL (Cloudinary transcodes on first request), so a
+    note recorded as WebM/Opus on Android still plays on older iPhones
+    (frontend ask 39)."""
+    content = await file.read()
+    response = await asyncio.to_thread(
+        cloudinary.uploader.upload, content, folder=folder, resource_type="video"
+    )
+    m4a_url, _ = cloudinary.utils.cloudinary_url(
+        response["public_id"],
+        resource_type="video",
+        format="m4a",
+        secure=True,
+        version=response.get("version"),
+    )
+    return {"original_url": response["secure_url"], "url": m4a_url}
+
+
 async def upload_private_file_to_cloudinary(file: UploadFile, folder: str) -> dict:
     """Uploads a file to Cloudinary's 'private' delivery type (spec §9: KYC
     files live in a private bucket, never publicly reachable by URL alone).

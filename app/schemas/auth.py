@@ -1,5 +1,7 @@
 from pydantic import BaseModel, EmailStr
 
+from app.core.validators import Password
+
 
 class ForgotPasswordSchema(BaseModel):
     email: EmailStr
@@ -8,12 +10,12 @@ class ForgotPasswordSchema(BaseModel):
 class ResetPasswordSchema(BaseModel):
     email: EmailStr
     otp: str
-    new_password: str
+    new_password: Password
 
 
 class ChangePasswordSchema(BaseModel):
     current_password: str
-    new_password: str
+    new_password: Password
 
 
 class RequestEmailChangeSchema(BaseModel):
@@ -23,3 +25,12 @@ class RequestEmailChangeSchema(BaseModel):
 
 class ConfirmEmailChangeSchema(BaseModel):
     otp: str
+
+
+class LogoutSchema(BaseModel):
+    refresh_token: str
+
+
+class TwoFactorDisableSchema(BaseModel):
+    current_password: str
+    totp_code: str  # a 6-digit authenticator code, or one unused backup code

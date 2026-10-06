@@ -3,7 +3,12 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 from beanie import Document, Link
-from pydantic import BaseModel
+from app.core.time import utc_now
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
+
+from app.core.validators import DOCUMENT_NUMBER_RULES
 
 from app.models.user import User
 
@@ -38,8 +43,8 @@ class Verification(Document):
     # Explicit consent capture for biometric processing — NDPR requires
     # documented consent for biometric data specifically.
     biometric_consent_given_at: datetime
-    created_at: datetime = datetime.utcnow()
-    updated_at: datetime = datetime.utcnow()
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     class Settings:
         name = "verifications"
@@ -47,7 +52,7 @@ class Verification(Document):
 
 
 class VerificationSubmit(BaseModel):
-    document_type: str
+    document_type: Literal["nin", "drivers_license", "voters_card", "passport"]
     document_number: str  # plaintext in transit only; encrypted before storage
     # From POST /verification/upload's response — a Cloudinary public_id,
     # not a URL (spec §9: private bucket).
@@ -62,6 +67,14 @@ class VerificationSubmit(BaseModel):
     document_image_upload_token: str
     liveness_selfie_upload_token: str
     biometric_consent: bool
+
+    @model_validator(mode="after")
+    def _check_document_number(self):
+        self.document_number = self.document_number.replace(" ", "")
+        pattern, message = DOCUMENT_NUMBER_RULES[self.document_type]
+        if not pattern.match(self.document_number):
+            raise ValueError(message)
+        return self
 
 
 class VerificationReview(BaseModel):

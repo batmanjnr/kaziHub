@@ -8,7 +8,8 @@ history (`granted_at`) is preserved and a role can be revoked independently.
 """
 from datetime import datetime
 from beanie import Document, Link
-from pydantic import BaseModel
+from app.core.time import utc_now
+from pydantic import BaseModel, Field
 from pymongo import IndexModel
 
 from app.models.user import User
@@ -17,7 +18,7 @@ from app.models.user import User
 class UserRole(Document):
     user: Link[User]
     role: str  # "client" | "artisan"
-    granted_at: datetime = datetime.utcnow()
+    granted_at: datetime = Field(default_factory=utc_now)
 
     class Settings:
         name = "user_roles"

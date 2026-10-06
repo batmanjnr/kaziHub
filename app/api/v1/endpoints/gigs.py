@@ -1,5 +1,5 @@
 # app/api/v1/endpoints/gigs.py
-from typing import List, Optional
+from typing import Annotated, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
 from beanie import PydanticObjectId
 
@@ -9,17 +9,20 @@ from app.models.profile import Profile
 from app.models.user import User
 from app.core.cloudinary import delete_file_from_cloudinary, upload_file_to_cloudinary
 from app.core.upload_validation import IMAGE_TYPES, validate_upload
+from app.models.uploads import UploadUrlResponse
 from app.services.moderation import moderate_image
 
 router = APIRouter()
 
 
-@router.post("/upload")
+@router.post("/upload", response_model=UploadUrlResponse)
 async def upload_gig_image(
     file: UploadFile = File(...),
     current_artisan: User = Depends(get_current_artisan),
 ):
-    """Upload gig images to Cloudinary (Artisans only)."""
+    """Upload a gig image (Artisans only). Multipart, one `file` field:
+    JPEG, PNG or WebP, up to 10 MB. Returns {"url": ...} for the gig's
+    `images` list."""
     await validate_upload(file, allowed_types=IMAGE_TYPES)
     secure_url = await upload_file_to_cloudinary(file, folder="kazihub/gigs")
     if not await moderate_image(secure_url):
@@ -67,6 +70,9 @@ async def create_gig(
 async def list_gigs(
     category: Optional[str] = None,
     tag: Optional[str] = None,
+    artisan_profile_id: Annotated[
+        Optional[str], Query(description="Only this artisan's gigs (their profile id).")
+    ] = None,
     # FIX (security review): unbounded before — a client could pass an
     # arbitrarily large `limit` and force the server to fetch/serialize
     # the entire public gig catalog in one response.
@@ -79,8 +85,13 @@ async def list_gigs(
         query["category"] = category
     if tag:
         query["tags"] = tag
+    if artisan_profile_id:
+        try:
+            query["artisan_profile.$id"] = PydanticObjectId(artisan_profile_id)
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artisan_profile_id.")
 
-    gigs = await Gig.find(query).skip(skip).limit(limit).to_list()
+    gigs = await Gig.find(query).sort("-created_at").skip(skip).limit(limit).to_list()
     return [build_gig_response(g) for g in gigs]
 
 

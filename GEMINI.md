@@ -26,47 +26,37 @@ KaziHub Backend is built using the **FastAPI** framework and leverages **Beanie 
 Below is an overview of the backend's directory structure to help you quickly locate components:
 
 ```text
-/Users/user/Desktop/kazihub-backend/
-├── app/                            # Main application package
-│   ├── api/                        # API route and dependency layer
-│   │   ├── deps.py                 # FastAPI Dependencies (auth, roles)
-│   │   └── v1/                     # Version 1 Router
+kaziHub/
+├── app/
+│   ├── main.py                     # App factory: Beanie init, middleware, /api/v1 router
+│   ├── worker.py                   # APScheduler background jobs (python -m app.worker)
+│   ├── api/
+│   │   ├── deps.py                 # Auth dependencies (user, artisan, admin+2FA, own profile)
+│   │   └── v1/
 │   │       ├── router.py           # V1 API entrypoint router
-│   │       └── endpoints/          # Route controller logic
-│   │           ├── auth.py         # Registration, login, OTP, resets
-│   │           ├── bookings.py     # Fixed service, quote request, gig bookings
-│   │           ├── chat.py         # Rest chat and websocket room endpoints
-│   │           ├── gigs.py         # Gig creation and management
-│   │           ├── portfolio.py    # Artisan portfolio handling
-│   │           ├── profiles.py     # Client and artisan profile details
-│   │           ├── search.py       # Discovery and listing searches
-│   │           ├── verification.py # ID/NIN document submissions
-│   │           └── wallet.py       # Payments, transactions, escrow management
-│   │
-│   ├── core/                       # Core system components
-│   │   ├── cloudinary.py           # Cloudinary configuration and upload helper
-│   │   ├── config.py               # Pydantic BaseSettings config loading (.env)
-│   │   ├── database.py             # Beanie/Motor client bootstrap helper
-│   │   ├── security.py             # Password hashing and JWT helpers
-│   │   └── websocket_manager.py    # Active websocket connections room map
-│   │
-│   ├── models/                     # Beanie Document models (ODM) & Pydantic schemas
-│   │   ├── booking.py              # Booking states, types, and schemas
-│   │   ├── chat.py                 # Conversations and message records
-│   │   ├── gig.py                  # Artisan gig schemas
-│   │   ├── pending_user.py         # Staged registration OTP collection
-│   │   ├── portfolio.py            # (Placeholder) Portfolio item document model
-│   │   ├── profile.py              # Artisan-specific profile extensions
-│   │   ├── transaction.py          # Ledger logs (Escrow deposit/release/refund)
-│   │   ├── user.py                 # Core user accounts, auth preferences
-│   │   └── verification.py         # ID verification records
-│   │
-│   └── services/                   # Business logic and background tasks
-│       └── email.py                # Email dispatchers (OTP, Reset) using smtplib
-│
-├── requirements.txt                # Python package list
-├── test_mail.py                    # Direct script for testing SMTP connection
-└── venv/                           # Python virtual environment
+│   │       └── endpoints/          # account (data export), admin, auth, bookings, chat,
+│   │                               # favorites, gigs, notifications, payments, portfolio,
+│   │                               # profiles, reviews, services, support, verification, wallet
+│   ├── core/                       # constants + validators (closed value sets, field rules),
+│   │                               # errors (APIError codes, JSON 500s), time (UTC now),
+│   │                               # config, security (JWT/bcrypt), encryption (AES-GCM PII),
+│   │                               # nin_hash, two_factor, rate_limit, security_headers,
+│   │                               # idempotency, ws_ticket, kyc_upload_token,
+│   │                               # upload_validation, cloudinary, websocket_manager
+│   ├── models/                     # Beanie documents + request/response schemas
+│   ├── schemas/                    # Standalone request schemas (auth)
+│   └── services/
+│       ├── booking_transitions.py  # Optimistic-locked booking state machine (all status changes)
+│       ├── payouts.py              # Claim-then-pay escrow release via Paystack Transfer
+│       ├── paystack.py             # Paystack API wrapper
+│       ├── notifications.py        # notify(): the one way notifications are created
+│       ├── email.py, sms.py, moderation.py
+│       └── jobs/                   # auto_release, cleanup, email_summary, notify, webhook_retry
+├── docs/FRONTEND_API_NOTES.md      # Flows, WebSocket protocol, field rules for the frontend
+├── scripts/migrate_frontend_asks.py # One-off live-data clean-up (dry run by default)
+├── tests/                          # pytest + mongomock-motor suite (never touches a real DB)
+├── requirements.txt
+└── test_mail.py                    # Direct script for testing SMTP connection
 ```
 
 ---

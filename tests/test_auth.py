@@ -169,7 +169,7 @@ async def test_login_requires_totp_when_2fa_enabled():
     with pytest.raises(HTTPException) as exc_info:
         await login(FakeRequest(), form_data=form, totp_code=None)
     assert exc_info.value.status_code == 401
-    assert exc_info.value.detail["code"] == "totp_required"
+    assert exc_info.value.code == "totp_required"
 
     # Wrong code -> still rejected.
     with pytest.raises(HTTPException) as exc_info:

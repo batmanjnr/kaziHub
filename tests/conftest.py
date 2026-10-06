@@ -1,3 +1,11 @@
+import os
+
+# Tests must never reach a real database: point the app's settings at an
+# address nothing listens on, before anything imports app.core.config.
+# (Environment variables take precedence over .env.)
+os.environ["MONGODB_URL"] = "mongodb://127.0.0.1:1/kazihub_tests_never_connect"
+os.environ.setdefault("SECRET_KEY", "test-secret")
+
 import mongomock
 import mongomock.filtering
 import pytest
@@ -83,6 +91,7 @@ from app.models.profile import Profile
 from app.models.review import Review
 from app.models.service import Service
 from app.models.session import UserSession
+from app.models.support_ticket import SupportTicket
 from app.models.transaction import Transaction
 from app.models.user import User
 from app.models.user_role import UserRole
@@ -94,7 +103,7 @@ from app.models.webhook_event import ProcessedWebhookEvent
 async def init_test_db():
     """Fresh in-memory Mongo (mongomock) per test, with every collection
     registered so relationship/link fields resolve correctly."""
-    client = AsyncMongoMockClient()
+    client = AsyncMongoMockClient(tz_aware=True)
     await init_beanie(
         database=client["kazihub_test"],
         document_models=[
@@ -120,6 +129,7 @@ async def init_test_db():
             ProcessedWebhookEvent,
             UserSession,
             IdempotencyRecord,
+            SupportTicket,
         ],
     )
     yield

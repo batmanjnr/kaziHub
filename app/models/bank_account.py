@@ -2,7 +2,8 @@
 from datetime import datetime
 from typing import Optional
 from beanie import Document, Link
-from pydantic import BaseModel
+from app.core.time import utc_now
+from pydantic import BaseModel, Field
 
 from app.models.user import User
 
@@ -15,7 +16,7 @@ class BankAccount(Document):
     account_name: str
     paystack_recipient_code: Optional[str] = None
     is_verified: bool = False
-    created_at: datetime = datetime.utcnow()
+    created_at: datetime = Field(default_factory=utc_now)
 
     class Settings:
         name = "artisan_bank_accounts"

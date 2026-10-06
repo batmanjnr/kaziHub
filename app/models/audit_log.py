@@ -4,7 +4,8 @@ the same DB transaction as the action itself (spec §2/§4.14)."""
 from datetime import datetime
 from typing import Optional
 from beanie import Document, Link
-from pydantic import BaseModel
+from app.core.time import utc_now
+from pydantic import BaseModel, Field
 
 from app.models.user import User
 
@@ -16,7 +17,7 @@ class AuditLog(Document):
     target_id: str
     reason: Optional[str] = None
     metadata: Optional[dict] = None
-    created_at: datetime = datetime.utcnow()
+    created_at: datetime = Field(default_factory=utc_now)
 
     class Settings:
         name = "audit_logs"

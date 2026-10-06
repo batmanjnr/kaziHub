@@ -1,5 +1,4 @@
 # app/api/v1/endpoints/verification.py
-from datetime import datetime
 from typing import List
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
@@ -20,11 +19,13 @@ from app.models.verification import (
 from app.core.cloudinary import generate_signed_kyc_url, upload_private_file_to_cloudinary
 from app.core.kyc_upload_token import sign_kyc_upload, verify_kyc_upload_token
 from app.core.upload_validation import IMAGE_TYPES, validate_upload
+from app.core.time import utc_now
+from app.models.uploads import KycUploadResponse
 
 router = APIRouter()
 
 
-@router.post("/upload")
+@router.post("/upload", response_model=KycUploadResponse)
 async def upload_verification_document(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
@@ -35,7 +36,8 @@ async def upload_verification_document(
     The token binds this public_id to the uploading user so it can't later
     be claimed by a different account (security-audit fix). Admins (and the
     applicant) see the file via a 15-minute signed URL, never a permanent
-    public link."""
+    public link. Multipart, one `file` field: JPEG, PNG or WebP, up to
+    10 MB."""
     await validate_upload(file, allowed_types=IMAGE_TYPES)
     result = await upload_private_file_to_cloudinary(file, folder="kazihub/verifications")
     result["upload_token"] = sign_kyc_upload(str(current_user.id), result["public_id"])
@@ -110,8 +112,8 @@ async def submit_verification(
                 "liveness_selfie_format": verification_in.liveness_selfie_format,
                 "status": VerificationStatus.PENDING,
                 "rejection_reason": None,
-                "biometric_consent_given_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "biometric_consent_given_at": utc_now(),
+                "updated_at": utc_now(),
             }
         )
         return build_verification_response(existing_verification)
@@ -124,7 +126,7 @@ async def submit_verification(
         document_image_format=verification_in.document_image_format,
         liveness_selfie_public_id=verification_in.liveness_selfie_public_id,
         liveness_selfie_format=verification_in.liveness_selfie_format,
-        biometric_consent_given_at=datetime.utcnow(),
+        biometric_consent_given_at=utc_now(),
     )
     await verification.insert()
     return build_verification_response(verification)
@@ -190,8 +192,8 @@ async def review_verification(
     verification.status = review_in.status
     verification.rejection_reason = review_in.rejection_reason
     verification.reviewed_by = current_user
-    verification.reviewed_at = datetime.utcnow()
-    verification.updated_at = datetime.utcnow()
+    verification.reviewed_at = utc_now()
+    verification.updated_at = utc_now()
     await verification.save()
 
     user_id = (

@@ -9,17 +9,22 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import get_current_admin
 from app.api.v1.endpoints.auth import revoke_all_sessions_for
-from app.api.v1.endpoints.bookings import build_booking_response
+from app.api.v1.endpoints.bookings import booking_response
 from app.core.idempotency import cache_response, get_cached_response, require_idempotency_key
 from app.core.two_factor import verify_admin_totp
 from app.models.audit_log import AuditLog, AuditLogResponse
 from app.models.booking import Booking, BookingResponse, BookingStatus, EscrowStatus
+from app.api.v1.endpoints.support import build_ticket_response
+from app.core.time import utc_now
 from app.models.dispute import Dispute, DisputeResponse
+from app.models.review import Review
+from app.models.support_ticket import SupportTicket, SupportTicketResponse
 from app.models.transaction import Transaction, TransactionStatus, TransactionType
 from app.models.user import User
 from app.models.verification import VerificationStatus, Verification
 from app.services.booking_transitions import apply_booking_transition
-from app.services.payouts import request_artisan_payout
+from app.services.notifications import notify, notify_booking_party
+from app.services.payouts import release_escrow_with_payout
 
 router = APIRouter()
 
@@ -149,38 +154,18 @@ async def resolve_dispute(
         new_escrow_status, new_booking_status = EscrowStatus.PARTIALLY_REFUNDED, BookingStatus.CANCELLED
         new_dispute_status = "resolved_split"
 
-    # A payout portion (artisan_paid / split) triggers a real Paystack
-    # Transfer, same as the normal completion flow — fail before touching
-    # the booking at all if Paystack won't accept it (spec §11.4).
-    payout_result = None
-    if release_amount > 0:
-        artisan_id = booking.artisan.ref.id if hasattr(booking.artisan, "ref") else booking.artisan.id
-        payout_result = await request_artisan_payout(
-            artisan_id, release_amount, reason=f"Dispute resolution payout for booking {booking.id}"
-        )
-        if payout_result["status"] != "pending":
-            error = payout_result["gateway_response"].get("error", "Payout could not be initiated.")
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"Payout failed: {error}")
+    prior_dispute_status = dispute.status
+    refund_reference = f"KZ-DISPUTE-REFUND-{str(booking.id)[:8]}-{ObjectId()}"
 
     async def _writes(b: Booking, session) -> None:
         if refund_amount > 0:
             await Transaction(
                 booking=b,
-                transaction_reference=f"KZ-DISPUTE-REFUND-{str(b.id)[:8]}-{ObjectId()}",
+                transaction_reference=refund_reference,
                 amount=refund_amount,
                 type=TransactionType.REFUND,
                 status=TransactionStatus.SUCCESSFUL,
             ).insert(session=session)
-        if release_amount > 0:
-            await Transaction(
-                booking=b,
-                transaction_reference=payout_result["reference"],
-                amount=release_amount,
-                type=TransactionType.ESCROW_RELEASE,
-                status=TransactionStatus.PENDING,
-                gateway_response=payout_result["gateway_response"],
-            ).insert(session=session)
-
         dispute.status = new_dispute_status
         dispute.resolution_notes = payload.resolution_notes
         dispute.resolved_by = current_admin
@@ -200,9 +185,9 @@ async def resolve_dispute(
             },
         ).insert(session=session)
 
-    await apply_booking_transition(
-        booking.id,
+    transition_kwargs = dict(
         allowed_statuses=[BookingStatus.DISPUTED],
+        allowed_escrow_statuses=None,
         updates={
             "escrow_status": new_escrow_status,
             "escrow_released_at": datetime.now(timezone.utc),
@@ -212,6 +197,51 @@ async def resolve_dispute(
         reason=f"Dispute resolved: {payload.resolution}",
         extra_writes=_writes,
     )
+
+    if release_amount > 0:
+        # A payout portion (artisan_paid / split) triggers a real Paystack
+        # Transfer — claimed first, paid second (see app.services.payouts).
+        # If Paystack rejects it, the booking goes back to disputed and the
+        # dispute is reopened, and the error surfaces here as a 400.
+        async def _rollback(b: Booking, session) -> None:
+            dispute.status = prior_dispute_status
+            dispute.resolution_notes = None
+            dispute.resolved_by = None
+            dispute.resolved_at = None
+            await dispute.save(session=session)
+            refund_tx = await Transaction.find_one({"transaction_reference": refund_reference})
+            if refund_tx:
+                refund_tx.status = TransactionStatus.FAILED
+                await refund_tx.save(session=session)
+            await AuditLog(
+                actor=current_admin,
+                action="dispute_resolution_rolled_back",
+                target_type="dispute",
+                target_id=str(dispute.id),
+                reason="Paystack rejected the artisan payout.",
+            ).insert(session=session)
+
+        await release_escrow_with_payout(
+            booking,
+            payout_amount=release_amount,
+            payout_reason=f"Dispute resolution payout for booking {booking.id}",
+            rollback_writes=_rollback,
+            **transition_kwargs,
+        )
+    else:
+        await apply_booking_transition(booking.id, **transition_kwargs)
+
+    outcome = {
+        "client_refund": "The client was refunded in full.",
+        "artisan_paid": "The payment was released to the artisan.",
+        "split": f"The payment was split: {release_amount:,.2f} NGN to the artisan, {refund_amount:,.2f} NGN refunded.",
+    }[payload.resolution]
+    resolved_booking = await Booking.get(booking.id)
+    for who in ("client", "artisan"):
+        await notify_booking_party(
+            resolved_booking, who, "dispute_resolved", "Dispute resolved",
+            f"The dispute on '{booking.title}' ({dispute.ticket_id}) was resolved. {outcome}",
+        )
 
     updated_dispute = await Dispute.get(dispute.id)
     response = build_dispute_response(updated_dispute)
@@ -287,7 +317,11 @@ async def force_refund_booking(
         extra_writes=_writes,
     )
 
-    response = build_booking_response(booking)
+    await notify_booking_party(
+        booking, "client", "booking_cancelled" if full_refund else "dispute_resolved",
+        "Refund issued", f"An admin refunded {payload.amount:,.2f} NGN on '{booking.title}'.",
+    )
+    response = await booking_response(booking, None)
     await cache_response(
         idempotency_key, current_admin, "admin.force_refund", response.model_dump(mode="json"), 200
     )
@@ -320,23 +354,7 @@ async def force_release_booking(
         )
     release_amount = booking.escrow_amount or booking.amount
 
-    artisan_id = booking.artisan.ref.id if hasattr(booking.artisan, "ref") else booking.artisan.id
-    payout_result = await request_artisan_payout(
-        artisan_id, release_amount, reason=f"Admin force-release for booking {booking.id}"
-    )
-    if payout_result["status"] != "pending":
-        error = payout_result["gateway_response"].get("error", "Payout could not be initiated.")
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"Payout failed: {error}")
-
     async def _writes(b: Booking, session) -> None:
-        await Transaction(
-            booking=b,
-            transaction_reference=payout_result["reference"],
-            amount=release_amount,
-            type=TransactionType.ESCROW_RELEASE,
-            status=TransactionStatus.PENDING,
-            gateway_response=payout_result["gateway_response"],
-        ).insert(session=session)
         await AuditLog(
             actor=current_admin,
             action="escrow_force_released",
@@ -346,8 +364,12 @@ async def force_release_booking(
             metadata={"amount": release_amount},
         ).insert(session=session)
 
-    booking = await apply_booking_transition(
-        booking.id,
+    booking = await release_escrow_with_payout(
+        booking,
+        payout_amount=release_amount,
+        payout_reason=f"Admin force-release for booking {booking.id}",
+        allowed_statuses=None,
+        allowed_escrow_statuses=[EscrowStatus.HELD_IN_ESCROW],
         updates={
             "escrow_status": EscrowStatus.RELEASED_TO_ARTISAN,
             "escrow_released_at": datetime.now(timezone.utc),
@@ -358,7 +380,11 @@ async def force_release_booking(
         extra_writes=_writes,
     )
 
-    response = build_booking_response(booking)
+    await notify_booking_party(
+        booking, "artisan", "payment_released", "Payment released",
+        f"An admin released the payment for '{booking.title}' to your bank account.",
+    )
+    response = await booking_response(booking, None)
     await cache_response(
         idempotency_key, current_admin, "admin.force_release", response.model_dump(mode="json"), 200
     )
@@ -507,3 +533,81 @@ async def analytics_overview(current_admin: User = Depends(get_current_admin)):
         "active_disputes": active_disputes,
         "kyc_queue_depth": kyc_queue_depth,
     }
+
+
+# ---------------------------------------------------------
+# LANDING-PAGE REVIEWS (frontend ask 40)
+# ---------------------------------------------------------
+class FeatureReviewRequest(BaseModel):
+    featured: bool
+
+
+@router.post("/reviews/{review_id}/feature")
+async def feature_review(
+    review_id: str,
+    payload: FeatureReviewRequest,
+    current_admin: User = Depends(get_current_admin),
+):
+    """Pin (or unpin) a review at the top of GET /reviews/featured. Only
+    reviews the client agreed to share can be featured."""
+    try:
+        review = await Review.get(PydanticObjectId(review_id))
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid review ID.")
+    if not review:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Review not found.")
+    if payload.featured and not review.share_publicly:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="The client hasn't agreed to share this review publicly."
+        )
+    review.is_featured = payload.featured
+    await review.save()
+    await AuditLog(
+        actor=current_admin,
+        action="review_featured" if payload.featured else "review_unfeatured",
+        target_type="review",
+        target_id=str(review.id),
+    ).insert()
+    return {"detail": "Review featured." if payload.featured else "Review unfeatured."}
+
+
+# ---------------------------------------------------------
+# SUPPORT TICKETS (frontend ask 14)
+# ---------------------------------------------------------
+class SupportTicketStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(open|in_progress|resolved|closed)$")
+
+
+@router.get("/support-tickets", response_model=List[SupportTicketResponse])
+async def list_support_tickets(
+    ticket_status: Optional[str] = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_admin: User = Depends(get_current_admin),
+):
+    query = {"status": ticket_status} if ticket_status else {}
+    tickets = await SupportTicket.find(query).sort("-created_at").skip(offset).limit(limit).to_list()
+    return [build_ticket_response(t) for t in tickets]
+
+
+@router.patch("/support-tickets/{ticket_id}", response_model=SupportTicketResponse)
+async def update_support_ticket(
+    ticket_id: str,
+    payload: SupportTicketStatusUpdate,
+    current_admin: User = Depends(get_current_admin),
+):
+    try:
+        ticket = await SupportTicket.get(PydanticObjectId(ticket_id))
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid ticket ID.")
+    if not ticket:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Ticket not found.")
+    ticket.status = payload.status
+    ticket.updated_at = utc_now()
+    await ticket.save()
+    owner_id = ticket.user.ref.id if hasattr(ticket.user, "ref") else ticket.user.id
+    await notify(
+        owner_id, "support_ticket_update", "Support request updated",
+        f"Your request {ticket.ticket_number} is now {payload.status.replace('_', ' ')}.",
+    )
+    return build_ticket_response(ticket)

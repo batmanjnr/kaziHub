@@ -36,7 +36,7 @@ async def make_artisan_with_profile(email="artisan@example.com") -> Profile:
     await user.insert()
     profile = Profile(
         user=user,
-        category="plumbing",
+        category="Plumbers",
         state="Lagos",
         business_name="Ade Plumbing Co",
         rating_average=4.5,
@@ -47,15 +47,15 @@ async def make_artisan_with_profile(email="artisan@example.com") -> Profile:
 
 async def test_list_profiles_filters_by_category_and_paginates():
     p1 = await make_artisan_with_profile("a1@example.com")
-    p1.category = "plumbing"
+    p1.category = "Plumbers"
     await p1.save()
 
     p2 = await make_artisan_with_profile("a2@example.com")
-    p2.category = "electrical"
+    p2.category = "Electricians"
     await p2.save()
 
     result = await list_profiles(
-        category="plumbing",
+        category="Plumbers",
         neighborhood=None,
         state=None,
         min_rating=None,
@@ -69,14 +69,14 @@ async def test_list_profiles_filters_by_category_and_paginates():
         offset=0,
     )
     assert result.meta.total == 1
-    assert result.data[0].category == "plumbing"
+    assert result.data[0].category == "Plumbers"
 
 
 async def test_service_crud_is_scoped_to_own_profile():
     profile = await make_artisan_with_profile()
 
     created = await create_service(
-        ServiceCreate(name="Pipe Fix", category="plumbing", pricing_type="fixed", price=5000),
+        ServiceCreate(name="Pipe Fix", category="Plumbers", pricing_type="fixed", price=5000),
         profile=profile,
     )
     assert created.name == "Pipe Fix"
@@ -103,7 +103,7 @@ async def test_portfolio_crud():
     created = await create_portfolio_item(
         PortfolioItemCreate(
             title="Kitchen repipe",
-            category="plumbing",
+            category="Plumbers",
             image_url="https://example.com/photo.jpg",
         ),
         profile=profile,
@@ -119,12 +119,12 @@ async def test_portfolio_crud():
 async def test_profile_detail_embeds_services_and_portfolio():
     profile = await make_artisan_with_profile()
     await create_service(
-        ServiceCreate(name="Leak Repair", category="plumbing", pricing_type="fixed", price=3000),
+        ServiceCreate(name="Leak Repair", category="Plumbers", pricing_type="fixed", price=3000),
         profile=profile,
     )
     await create_portfolio_item(
         PortfolioItemCreate(
-            title="Bathroom job", category="plumbing", image_url="https://example.com/a.jpg"
+            title="Bathroom job", category="Plumbers", image_url="https://example.com/a.jpg"
         ),
         profile=profile,
     )
@@ -142,7 +142,7 @@ async def test_gig_view_counter_increments_on_fetch():
         GigCreate(
             title="Custom shelving",
             description="Built-in shelves",
-            category="carpentry",
+            category="Carpenters",
             price=15000,
             delivery_time_days=3,
         ),

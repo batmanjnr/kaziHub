@@ -4,7 +4,13 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.deps import get_current_user
-from app.models.notification import Notification, NotificationResponse
+from app.models.notification import (
+    NOTIFICATION_TYPES,
+    Notification,
+    NotificationPreferences,
+    NotificationPreferencesUpdate,
+    NotificationResponse,
+)
 from app.models.user import User
 
 router = APIRouter()
@@ -44,6 +50,35 @@ async def list_notifications(
         .to_list()
     )
     return [build_notification_response(n) for n in notifications]
+
+
+@router.get("/types")
+async def list_notification_types():
+    """Every value a notification's `type` can take, with what it means (ask 31)."""
+    return NOTIFICATION_TYPES
+
+
+@router.get("/preferences", response_model=NotificationPreferences)
+async def get_notification_preferences(current_user: User = Depends(get_current_user)):
+    """The user's notification switches (ask 12). `email_summaries`: a daily
+    email listing unread notifications. `push_enabled`: stored for when push
+    delivery is added; in-app notifications are always created."""
+    return NotificationPreferences(
+        push_enabled=current_user.push_enabled, email_summaries=current_user.email_summaries
+    )
+
+
+@router.put("/preferences", response_model=NotificationPreferences)
+async def update_notification_preferences(
+    payload: NotificationPreferencesUpdate, current_user: User = Depends(get_current_user)
+):
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(current_user, field, value)
+    await current_user.save()
+    return NotificationPreferences(
+        push_enabled=current_user.push_enabled, email_summaries=current_user.email_summaries
+    )
 
 
 @router.patch("/read-all", status_code=status.HTTP_200_OK)
