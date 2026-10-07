@@ -240,14 +240,54 @@ async def send_chat_message(conv: Conversation, sender_id: str, data: MessageCre
 # ---------------------------------------------------------
 @router.post("/ws-ticket", response_model=WsTicketResponse)
 async def issue_ws_ticket(current_user: User = Depends(get_current_user)):
-    """Issue a one-time ticket for opening the chat WebSocket (ask 32).
+    """Issue a one-time ticket for the live chat WebSocket, and the full
+    socket protocol (ask 32 — FastAPI can't list WebSocket routes in
+    /openapi.json, so it's documented here).
 
-    The ticket is single-use and expires after 30 seconds, so fetch a new
-    one for every (re)connect. Open:
+    **Connect**
 
-        wss://<api-host>/api/v1/chat/ws/{conversation_id}?ticket={ticket}
+    1. Call this endpoint. The ticket is single-use and expires 30 seconds
+       after it's issued, so fetch a new one for every connect/reconnect.
+    2. Open `wss://<api-host>/api/v1/chat/ws/{conversation_id}?ticket={ticket}`.
 
-    See the WebSocket section of docs/FRONTEND_API_NOTES.md for every event.
+    **Close codes**
+
+    - `1008` before the connection is accepted: ticket missing, expired or
+      already used; conversation not found; or you aren't one of its two
+      participants. Fetch a new ticket before retrying.
+    - `1000`/`1001`: normal close (you or the server shut down). Reconnect
+      with a new ticket.
+    - Anything else (e.g. `1006`): network drop. Reconnect with a new ticket
+      and re-fetch `GET /conversations/{id}/messages` to fill any gap.
+
+    **Client → server** (JSON objects)
+
+    | Action | Body |
+    |---|---|
+    | send a message | `{"action": "send", "content": "Hi", "message_type": "text"}` — any fields of the REST send body (`content`, `attachments`, `audio_url`, `media_type`, `audio_duration`, `audio_wave_data`, `location_data`, `message_type`). `"action"` may be omitted. |
+    | mark read | `{"action": "mark_read"}` |
+    | typing | `{"action": "typing", "is_typing": true}` (send `false` when they stop) |
+    | keep-alive | `{"action": "ping"}` (e.g. every 25 s) |
+
+    **Server → client** (every frame has `"event"`)
+
+    | Event | Payload |
+    |---|---|
+    | `new_message` | `{"event": "new_message", "message": <MessageResponse, same as REST>}` — also echoed to the sender |
+    | `message_delivered` | `{"event": "message_delivered", "conversation_id": "...", "message_id": "..."}` — the recipient had this chat open |
+    | `messages_read` | `{"event": "messages_read", "conversation_id": "...", "reader_id": "..."}` — everything not sent by reader_id is now read |
+    | `typing` | `{"event": "typing", "conversation_id": "...", "user_id": "...", "is_typing": true}` — never sent back to the typist |
+    | `pong` | `{"event": "pong"}` |
+    | `error` | `{"event": "error", "code": "...", "detail": ...}` — the socket stays open. Codes: `invalid_json`, `unknown_action`, `validation_error` (detail is the list of field errors), `account_frozen`, `recipient_unavailable`, `rejected` |
+    | `booking_updated` | `{"booking_id", "status"}` — a quote was requested |
+    | `quote_received` | `{"message": {id, conversation_id, sender_id, content, message_type: "quote_offer", quote_data: {booking_id, amount, breakdown}, created_at}}` |
+    | `quote_accepted` | `{"booking_id", "status"}` |
+    | `escrow_funded` | `{"booking_id", "status", "amount"?}` |
+    | `escrow_released` | `{"booking_id", "status"}` |
+    | `booking_status_changed` | `{"booking_id", "status"}` |
+
+    A message's `status` goes `sent` → `delivered` (if the recipient was
+    connected) → `read`. Times are UTC with an offset.
     """
     ticket = ws_ticket_store.issue(str(current_user.id))
     return WsTicketResponse(

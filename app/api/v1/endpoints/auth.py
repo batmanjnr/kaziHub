@@ -168,6 +168,10 @@ async def deactivate_account(user: User) -> None:
     user.token_version += 1
     await user.save()
     await revoke_all_sessions_for(user)
+    # A deleted artisan disappears from search and their page 404s.
+    profile = await Profile.find_one({"user.$id": user.id})
+    if profile:
+        await profile.set({"is_paused": True})
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -400,7 +404,8 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     totp_code: Optional[str] = Form(
         default=None,
-        description="6-digit authenticator code, or an unused backup code, when the account has 2FA on.",
+        description="When the account has 2FA on: the 6-digit authenticator code, or one unused backup code "
+        "(8 characters 0-9/A-F shown as `7F3A-9C21`; hyphen optional, any case).",
     ),
 ):
     """Authenticate user and return an access/refresh token pair.
@@ -728,7 +733,8 @@ class TwoFactorVerifySchema(BaseModel):
 class TwoFactorEnabledResponse(BaseModel):
     detail: str
     backup_codes: List[str] = Field(
-        description="Ten single-use recovery codes. Shown only once — the user should save them."
+        description="Ten single-use recovery codes, each 8 characters 0-9/A-F shown as `7F3A-9C21`. "
+        "Shown only once — the user should save them."
     )
 
 

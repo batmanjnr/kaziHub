@@ -1,9 +1,10 @@
 # app/api/v1/endpoints/notifications.py
 from typing import List
 from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.models.notification import (
     NOTIFICATION_TYPES,
     Notification,
@@ -11,7 +12,14 @@ from app.models.notification import (
     NotificationPreferencesUpdate,
     NotificationResponse,
 )
+from app.models.push_subscription import (
+    PushPublicKeyResponse,
+    PushSubscription,
+    PushSubscriptionCreate,
+    PushSubscriptionDelete,
+)
 from app.models.user import User
+from app.services.push import push_configured
 
 router = APIRouter()
 
@@ -61,8 +69,10 @@ async def list_notification_types():
 @router.get("/preferences", response_model=NotificationPreferences)
 async def get_notification_preferences(current_user: User = Depends(get_current_user)):
     """The user's notification switches (ask 12). `email_summaries`: a daily
-    email listing unread notifications. `push_enabled`: stored for when push
-    delivery is added; in-app notifications are always created."""
+    email listing unread notifications. `push_enabled`: every notification
+    is also pushed to the devices registered with
+    POST /notifications/push/subscriptions. In-app notifications are always
+    created."""
     return NotificationPreferences(
         push_enabled=current_user.push_enabled, email_summaries=current_user.email_summaries
     )
@@ -79,6 +89,58 @@ async def update_notification_preferences(
     return NotificationPreferences(
         push_enabled=current_user.push_enabled, email_summaries=current_user.email_summaries
     )
+
+
+@router.get("/push/public-key", response_model=PushPublicKeyResponse)
+async def get_push_public_key():
+    """Web Push setup (ask 44). In the browser/PWA, after the user allows
+    notifications:
+
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true, applicationServerKey: <public_key>,
+        });
+        POST /notifications/push/subscriptions with sub.toJSON()
+
+    Each push carries JSON: {"notification_id", "type", "title", "body",
+    "booking_id"} for the service worker's `push` handler to show.
+    """
+    if not push_configured():
+        return PushPublicKeyResponse(enabled=False)
+    return PushPublicKeyResponse(enabled=True, public_key=settings.VAPID_PUBLIC_KEY)
+
+
+@router.post("/push/subscriptions", status_code=status.HTTP_201_CREATED)
+async def subscribe_to_push(
+    payload: PushSubscriptionCreate, request: Request = None, current_user: User = Depends(get_current_user)
+):
+    """Register this device for push. Send the browser's
+    `PushSubscription.toJSON()` as is. Re-sending the same endpoint (or a
+    device changing hands) just updates it."""
+    existing = await PushSubscription.find_one({"endpoint": payload.endpoint})
+    fields = {
+        "p256dh": payload.keys.p256dh,
+        "auth": payload.keys.auth,
+        "user_agent": request.headers.get("user-agent") if request else None,
+    }
+    if existing:
+        existing.user = current_user
+        for k, v in fields.items():
+            setattr(existing, k, v)
+        await existing.save()
+    else:
+        await PushSubscription(user=current_user, endpoint=payload.endpoint, **fields).insert()
+    return {"detail": "Push notifications enabled on this device."}
+
+
+@router.delete("/push/subscriptions", status_code=status.HTTP_200_OK)
+async def unsubscribe_from_push(
+    payload: PushSubscriptionDelete, current_user: User = Depends(get_current_user)
+):
+    """Stop pushing to this device (call alongside the browser's
+    `subscription.unsubscribe()`, and on sign-out)."""
+    await PushSubscription.find({"endpoint": payload.endpoint, "user.$id": current_user.id}).delete()
+    return {"detail": "Push notifications disabled on this device."}
 
 
 @router.patch("/read-all", status_code=status.HTTP_200_OK)

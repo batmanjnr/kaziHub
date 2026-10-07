@@ -5,7 +5,7 @@ field — the same rules the frontend already applies in its forms, enforced
 here so a direct API call can't save anything else."""
 import re
 from datetime import date
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import AfterValidator, BeforeValidator, Field
 
@@ -95,7 +95,19 @@ Language = Annotated[str, AfterValidator(_one_of(LANGUAGES, "preferred_language"
 Theme = Annotated[str, BeforeValidator(lambda v: v.lower() if isinstance(v, str) else v), AfterValidator(_one_of(THEMES, "theme"))]
 ResponseTime = Annotated[str, AfterValidator(_one_of(RESPONSE_TIMES, "response_time"))]
 DurationEstimate = Annotated[str, AfterValidator(_one_of(DURATION_ESTIMATES, "duration_estimate"))]
-PhoneVisibility = Annotated[str, AfterValidator(_one_of(PHONE_VISIBILITY_OPTIONS, "phone_visibility"))]
+PHONE_VISIBILITY_DESCRIPTION = (
+    "Who sees this person's phone number, on a booking they share:\n"
+    "- `after_escrow` (default): the other party, once the booking is paid into escrow "
+    "(status escrow_funded, in_progress, completed_by_artisan, paid_out or disputed).\n"
+    "- `verified_only`: the same, and only if the other party is ID-verified (for an artisan's number: "
+    "the client's ID verification is approved; for a client's number: the artisan's profile is verified).\n"
+    "- `hidden`: never shown.\n"
+    "Numbers are never shown on public profiles, search results or chat."
+)
+PhoneVisibility = Annotated[
+    Literal["after_escrow", "verified_only", "hidden"],
+    Field(description=PHONE_VISIBILITY_DESCRIPTION),
+]
 Password = Annotated[
     str,
     Field(

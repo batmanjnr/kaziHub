@@ -24,14 +24,22 @@ async def list_favorites(current_user: User = Depends(get_current_user)):
         .sort("-created_at")
         .to_list()
     )
+    artisan_ids = [s.artisan.ref.id if hasattr(s.artisan, "ref") else s.artisan.id for s in saved]
+    users = {u.id: u for u in await User.find({"_id": {"$in": artisan_ids}}).to_list()}
+    profiles = {
+        (p.user.ref.id if hasattr(p.user, "ref") else p.user.id): p
+        for p in await Profile.find({"user.$id": {"$in": artisan_ids}}).to_list()
+    }
     results = []
-    for s in saved:
-        artisan_id = s.artisan.ref.id if hasattr(s.artisan, "ref") else s.artisan.id
-        profile = await Profile.find_one({"user.$id": artisan_id})
-        artisan_user = await User.get(artisan_id)
+    for s, artisan_id in zip(saved, artisan_ids):
+        profile = profiles.get(artisan_id)
+        artisan_user = users.get(artisan_id)
         results.append(
             FavoriteResponse(
                 artisan_id=str(artisan_id),
+                artisan_profile_id=str(profile.id) if profile else None,
+                first_name=artisan_user.first_name if artisan_user else None,
+                last_name=artisan_user.last_name if artisan_user else None,
                 business_name=profile.business_name if profile else None,
                 category=profile.category if profile else None,
                 rating_average=profile.rating_average if profile else None,

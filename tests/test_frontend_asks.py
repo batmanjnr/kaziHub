@@ -211,14 +211,21 @@ async def test_bank_list_comes_from_paystack(monkeypatch):
     from app.api.v1.endpoints import payments
 
     async def fake_list_banks():
-        return [{"code": "058", "name": "GTBank", "active": True}, {"code": "044", "name": "Access Bank", "active": True}]
+        return [
+            {"code": "058", "name": "GTBank", "slug": "gtbank", "active": True, "supports_transfer": True},
+            {"code": "044", "name": "Access Bank", "slug": "access", "active": True, "supports_transfer": True},
+            {"code": "50572", "name": "BANKIT MFB", "slug": "bankit-mfb-ng", "supports_transfer": True},
+            {"code": "50572", "name": "BANKIT MICROFINANCE BANK LTD", "slug": "bankit-ltd", "supports_transfer": True},
+            {"code": "999", "name": "No Transfers MFB", "slug": "nt", "supports_transfer": False},
+        ]
 
     monkeypatch.setattr(payments, "list_banks", fake_list_banks)
     payments._banks_cache.update({"at": 0.0, "banks": []})
     user = await make_user("bank@example.com")
     async with client() as c:
         r = await c.get(f"{API}/payments/banks", headers=await auth_headers(user))
-    assert r.json() == [{"code": "044", "name": "Access Bank"}, {"code": "058", "name": "GTBank"}]
+    assert [b["name"] for b in r.json()] == ["Access Bank", "BANKIT MICROFINANCE BANK LTD", "GTBank"]
+    assert r.json()[0] == {"code": "044", "name": "Access Bank", "slug": "access"}
 
 
 # ---------------- Bookings & escrow (23-30) ----------------
@@ -491,3 +498,81 @@ async def test_proxy_ip_uses_the_entry_the_proxy_appended(monkeypatch):
         "type": "http", "headers": [(b"x-forwarded-for", b"6.6.6.6, 41.58.1.2")], "client": ("10.0.0.1", 1),
     })
     assert rate_limit.get_client_ip(request) == "41.58.1.2"  # not the forgeable left-most entry
+
+
+# ---------------- Round 2 (7 October 2026): asks 11, 43, 44, 46 ----------------
+
+async def test_phone_visibility_is_an_enum_in_the_schema():
+    from app.main import app
+
+    prop = app.openapi()["components"]["schemas"]["UserResponse"]["properties"]["phone_visibility"]
+    assert prop["enum"] == ["after_escrow", "verified_only", "hidden"]
+    assert "after_escrow" in prop["description"]
+
+
+async def test_saved_artisans_carry_names_and_profile_id():
+    user = await make_user("fav2@example.com")
+    artisan, profile = await make_artisan("fav2a@example.com")
+    async with client() as c:
+        await c.post(f"{API}/favorites/{artisan.id}", headers=await auth_headers(user))
+        r = await c.get(f"{API}/favorites/", headers=await auth_headers(user))
+    item = r.json()[0]
+    assert (item["first_name"], item["last_name"], item["artisan_profile_id"]) == ("Bola", "Ade", str(profile.id))
+
+
+async def test_backup_code_works_lowercase_and_without_hyphen():
+    user = await make_user("bc@example.com")
+    headers = await auth_headers(user)
+    async with client() as c:
+        secret = (await c.post(f"{API}/auth/2fa/setup", headers=headers)).json()["secret"]
+        codes = (await c.post(f"{API}/auth/2fa/verify", headers=headers,
+                              json={"totp_code": pyotp.TOTP(secret).now()})).json()["backup_codes"]
+        assert all(len(code) == 9 and code[4] == "-" for code in codes)
+        r = await c.post(f"{API}/auth/login", data={
+            "username": user.email, "password": "Passw0rd!", "totp_code": codes[0].replace("-", "").lower(),
+        })
+        reused = await c.post(f"{API}/auth/login", data={
+            "username": user.email, "password": "Passw0rd!", "totp_code": codes[0],
+        })
+    assert r.status_code == 200
+    assert reused.json()["code"] == "totp_invalid"
+
+
+async def test_push_subscription_and_delivery(monkeypatch):
+    from app.core.config import settings
+    from app.models.push_subscription import PushSubscription
+    from app.services import push
+
+    sent = []
+    monkeypatch.setattr(settings, "VAPID_PUBLIC_KEY", "BPUBLIC")
+    monkeypatch.setattr(settings, "VAPID_PRIVATE_KEY", "private")
+    monkeypatch.setattr(push, "webpush", lambda **kw: sent.append(kw))
+
+    client_user = await make_user("push@example.com")
+    artisan, _ = await make_artisan("pusha@example.com")
+    conv = Conversation(client=client_user, artisan=artisan)
+    await conv.insert()
+    sub = {"endpoint": "https://push.example.com/abc", "keys": {"p256dh": "key", "auth": "secret"}}
+    async with client() as c:
+        key = await c.get(f"{API}/notifications/push/public-key")
+        r = await c.post(f"{API}/notifications/push/subscriptions", headers=await auth_headers(artisan), json=sub)
+        await c.post(f"{API}/conversations/{conv.id}/messages", headers=await auth_headers(client_user),
+                     json={"content": "hello"})
+        await asyncio.gather(*push._pending)
+        await c.request("DELETE", f"{API}/notifications/push/subscriptions",
+                        headers=await auth_headers(artisan), json={"endpoint": sub["endpoint"]})
+    assert key.json() == {"enabled": True, "public_key": "BPUBLIC"}
+    assert r.status_code == 201
+    assert len(sent) == 1 and sent[0]["subscription_info"]["endpoint"] == sub["endpoint"]
+    assert '"type": "new_message"' in sent[0]["data"]
+    assert await PushSubscription.find({}).count() == 0
+
+
+async def test_deleted_artisan_drops_out_of_search():
+    artisan, profile = await make_artisan("gone@example.com")
+    async with client() as c:
+        await c.delete(f"{API}/auth/me", headers=await auth_headers(artisan))
+        listing = await c.get(f"{API}/profiles/")
+        page = await c.get(f"{API}/profiles/{profile.id}")
+    assert listing.json()["meta"]["total"] == 0
+    assert page.status_code == 404

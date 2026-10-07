@@ -15,6 +15,7 @@ from beanie import PydanticObjectId
 from app.models.booking import Booking
 from app.models.notification import NOTIFICATION_TYPES, Notification
 from app.models.user import User
+from app.services.push import push_to_user
 
 logger = logging.getLogger("kazihub.notifications")
 
@@ -40,7 +41,15 @@ async def notify(
             user = await User.get(PydanticObjectId(str(user)))
             if not user:
                 return
-        await Notification(user=user, type=type, title=title, message=message, booking=booking).insert()
+        notification = Notification(user=user, type=type, title=title, message=message, booking=booking)
+        await notification.insert()
+        push_to_user(user, {
+            "notification_id": str(notification.id),
+            "type": type,
+            "title": title,
+            "body": message,
+            "booking_id": str(booking.id) if booking else None,
+        })
     except Exception:
         logger.exception("Failed to create %s notification", type)
 

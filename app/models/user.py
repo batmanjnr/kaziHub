@@ -167,7 +167,7 @@ class UserResponse(BaseModel):
     profile_picture: Optional[str] = None
     theme: str = "system"
     preferred_language: str = "en"
-    phone_visibility: str = "after_escrow"
+    phone_visibility: PhoneVisibility = "after_escrow"
     share_neighborhood: bool = True
     terms_version: Optional[str] = None
     terms_accepted_at: Optional[datetime] = None

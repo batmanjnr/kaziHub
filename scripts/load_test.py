@@ -50,7 +50,7 @@ async def _db():
         AuditLog, BankAccount, Booking, BookingStatusHistory, Conversation, Dispute, Gig,
         IdempotencyRecord, Message, Notification, PendingUser, PortfolioItem, Profile, Review,
         SavedProfessional, Service, SupportTicket, Transaction, User, UserRole, UserSession,
-        Verification, ProcessedWebhookEvent,
+        Verification, ProcessedWebhookEvent, PushSubscription,
     )
     client = AsyncIOMotorClient(settings.MONGODB_URL, tlsCAFile=certifi.where(), tz_aware=True)
     await init_beanie(
@@ -59,7 +59,7 @@ async def _db():
             User, UserRole, Profile, Service, PortfolioItem, Gig, Verification, PendingUser,
             Conversation, Message, Booking, BookingStatusHistory, Dispute, Review, Notification,
             AuditLog, SavedProfessional, BankAccount, Transaction, ProcessedWebhookEvent,
-            UserSession, IdempotencyRecord, SupportTicket,
+            UserSession, IdempotencyRecord, SupportTicket, PushSubscription,
         ],
     )
     return client
@@ -121,8 +121,8 @@ async def cleanup() -> None:
     from beanie import PydanticObjectId
     from app.main import (
         Booking, BookingStatusHistory, Conversation, Dispute, Gig, IdempotencyRecord, Message,
-        Notification, PortfolioItem, Profile, Review, SavedProfessional, Service, SupportTicket,
-        Transaction, User, UserRole, UserSession,
+        Notification, PortfolioItem, Profile, PushSubscription, Review, SavedProfessional, Service,
+        SupportTicket, Transaction, User, UserRole, UserSession,
     )
 
     client = await _db()
@@ -155,6 +155,7 @@ async def cleanup() -> None:
         ("sessions", UserSession.find({"user.$id": {"$in": ids}})),
         ("favorites", SavedProfessional.find({"$or": [{"user.$id": {"$in": ids}}, {"artisan.$id": {"$in": ids}}]})),
         ("support_tickets", SupportTicket.find({"user.$id": {"$in": ids}})),
+        ("push_subscriptions", PushSubscription.find({"user.$id": {"$in": ids}})),
         ("idempotency", IdempotencyRecord.find({"user.$id": {"$in": ids}})),
         ("user_roles", UserRole.find({"user.$id": {"$in": ids}})),
         ("users", User.find({"_id": {"$in": ids}})),

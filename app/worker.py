@@ -37,6 +37,7 @@ from app.models.profile import Profile
 from app.models.review import Review
 from app.models.service import Service
 from app.models.session import UserSession
+from app.models.push_subscription import PushSubscription
 from app.models.support_ticket import SupportTicket
 from app.models.transaction import Transaction
 from app.models.user import User
@@ -97,6 +98,7 @@ async def main():
             UserSession,
             IdempotencyRecord,
             SupportTicket,
+            PushSubscription,
         ],
     )
 

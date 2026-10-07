@@ -175,10 +175,6 @@ class ProfileResponse(BaseModel):
     completed_jobs_count: int = 0
     response_time: Optional[str] = None
     insurance_backed: bool = False
-    phone_visibility: str = Field(
-        default="after_escrow",
-        description="after_escrow: shared with a client once their booking is paid into escrow; "
-        "verified_only: as after_escrow, and only if that client's ID is verified; hidden: never shared.",
-    )
+    phone_visibility: PhoneVisibility = "after_escrow"
     share_neighborhood: bool = True
     is_paused: bool = Field(default=False, description="Account frozen; never true in public listings.")

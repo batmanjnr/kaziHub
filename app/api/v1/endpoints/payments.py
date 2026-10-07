@@ -21,17 +21,37 @@ class VerifyBankAccountRequest(BaseModel):
 class BankOption(BaseModel):
     code: str
     name: str
+    slug: str
 
 
 BANKS_CACHE_SECONDS = 24 * 60 * 60
 _banks_cache: dict = {"at": 0.0, "banks": []}
 
 
+def _clean_bank_list(raw: list) -> List[BankOption]:
+    """One entry per bank code, only banks payouts can actually reach
+    (ask 45). Paystack lists some banks twice under different names with
+    the same code (e.g. "BANKIT MFB" / "BANKIT MICROFINANCE BANK LTD");
+    the longer, more descriptive name is kept."""
+    by_code = {}
+    for b in raw:
+        code, name = b.get("code"), (b.get("name") or "").strip()
+        if not code or not name or not b.get("active", True) or b.get("is_deleted"):
+            continue
+        if b.get("supports_transfer") is False:
+            continue
+        current = by_code.get(code)
+        if current is None or len(name) > len(current.name):
+            by_code[code] = BankOption(code=code, name=name, slug=b.get("slug") or code)
+    return sorted(by_code.values(), key=lambda x: x.name.lower())
+
+
 @router.get("/banks", response_model=List[BankOption])
 async def get_banks(current_user: User = Depends(get_current_user)):
-    """Banks an artisan can be paid into, A-Z (ask 21). Send the chosen
-    `code` as `bank_code` to POST /payments/verify-bank-account. Sourced
-    from Paystack and cached for 24 hours."""
+    """Banks an artisan can be paid into, A-Z (asks 21, 45). Send the
+    chosen `code` as `bank_code` to POST /payments/verify-bank-account.
+    Each bank code appears once, and banks that can't receive transfers are
+    left out. Sourced from Paystack and cached for 24 hours."""
     if not _banks_cache["banks"] or time.time() - _banks_cache["at"] > BANKS_CACHE_SECONDS:
         try:
             raw = await list_banks()
@@ -39,16 +59,7 @@ async def get_banks(current_user: User = Depends(get_current_user)):
             if _banks_cache["banks"]:
                 return _banks_cache["banks"]
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=e.client_message())
-        seen, banks = set(), []
-        for b in raw:
-            code, name = b.get("code"), b.get("name")
-            if not code or not name or not b.get("active", True) or b.get("is_deleted"):
-                continue
-            if (code, name) in seen:
-                continue
-            seen.add((code, name))
-            banks.append(BankOption(code=code, name=name))
-        _banks_cache["banks"] = sorted(banks, key=lambda x: x.name.lower())
+        _banks_cache["banks"] = _clean_bank_list(raw)
         _banks_cache["at"] = time.time()
     return _banks_cache["banks"]
 

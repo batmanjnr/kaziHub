@@ -59,7 +59,7 @@ We kept the human-readable phrases for `response_time` and `duration_estimate`, 
 - **Current device (ask 9):** access tokens carry `sid`. `GET /auth/sessions` items have `session_id` and `is_current`.
 - **Signed-out devices (ask 19):** a revoked session's access token gets `401 session_signed_out` immediately. Refreshing it returns `"This session was signed out."` with the same code. `refresh_token_reused` is kept for a genuinely replayed token.
 - **2FA (ask 10):**
-  - `POST /auth/2fa/verify` now returns `backup_codes` (10 single-use codes, shown once).
+  - `POST /auth/2fa/verify` now returns `backup_codes`: 10 single-use codes, shown once. Each is 8 characters `0-9`/`A-F`, shown as `7F3A-9C21`. They're accepted with or without the hyphen, in any case (ask 46).
   - `POST /auth/2fa/disable {"current_password", "totp_code"}` accepts an authenticator code or a backup code.
   - `POST /auth/2fa/backup-codes {"totp_code"}` issues a fresh set.
   - Admins can't turn 2FA off.
@@ -69,7 +69,7 @@ We kept the human-readable phrases for `response_time` and `duration_estimate`, 
   - `totp_invalid`: wrong or expired code.
 
   The 2FA codes are only returned after the password check passes. `totp_code` also accepts a backup code.
-- **Customer privacy (ask 11):** customers now have `phone_visibility` and `share_neighborhood` on `PUT /auth/me` / `GET /auth/me`, with the same values as artisans. Enforcement:
+- **Customer privacy (ask 11):** customers now have `phone_visibility` and `share_neighborhood` on `PUT /auth/me` / `GET /auth/me`, with the same values as artisans. `phone_visibility` is an enum in the schema (`after_escrow`, `verified_only`, `hidden`), and its description in `/openapi.json` spells out each value. Enforcement:
   - `phone_visibility`:
     - `after_escrow`: the number appears on the other party's booking (`client_phone` / `artisan_phone`) once the booking is paid into escrow.
     - `verified_only`: the same, but only for an ID-verified viewer. For a customer's number, that means a verified artisan.
@@ -85,7 +85,14 @@ We kept the human-readable phrases for `response_time` and `duration_estimate`, 
   - problems: `booking_cancelled`, `booking_disputed`, `dispute_resolved`, `payout_issue`
   - other: `new_message`, `new_review`, `verification_review`, `support_ticket_update`
 - A `new_message` notification is created only when the recipient doesn't have that chat open over the WebSocket.
-- `GET`/`PUT /notifications/preferences` stores `{"push_enabled", "email_summaries"}`. With `email_summaries` on, the worker emails a daily digest of unread notifications at 07:00 Lagos time. **Push isn't sent by the backend yet**: there is no push provider, so the switch is stored for when one is added.
+- `GET`/`PUT /notifications/preferences` stores `{"push_enabled", "email_summaries"}`. With `email_summaries` on, the worker emails a daily digest of unread notifications at 07:00 Lagos time.
+- **Web Push (ask 44):** with `push_enabled` on, every notification is also pushed to the user's registered devices.
+  1. `GET /notifications/push/public-key` returns `{"enabled", "public_key"}`. `enabled` is false until the server has its keys.
+  2. In the service worker's page, call `registration.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: public_key})`.
+  3. `POST /notifications/push/subscriptions` with `subscription.toJSON()` as is.
+  4. `DELETE /notifications/push/subscriptions {"endpoint"}` on sign-out or when the user turns it off.
+
+  Each push payload is JSON `{"notification_id", "type", "title", "body", "booking_id"}` for the service worker's `push` handler to display. Expired subscriptions are removed automatically.
 
 ## Bookings and escrow (asks 23–30)
 
@@ -125,6 +132,8 @@ We kept the human-readable phrases for `response_time` and `duration_estimate`, 
 
 ### WebSocket protocol
 
+The same protocol, including close codes, is in the description of `POST /chat/ws-ticket` in `/openapi.json`, so you don't need this repository to read it (ask 32).
+
 1. `POST /chat/ws-ticket` returns `{"ticket", "expires_in": 30, "websocket_path"}`. Tickets are single-use; fetch a new one per (re)connect.
 2. Open `wss://<host>/api/v1/chat/ws/{conversation_id}?ticket={ticket}`. A bad ticket, unknown conversation or non-participant is closed with code 1008.
 
@@ -154,7 +163,7 @@ Message `status` goes `sent` → `delivered` (if the recipient was connected liv
 ## Everything else
 
 - **Portfolio (ask 7):** `PATCH /profiles/me/portfolio/{id}` takes any subset of fields and keeps the id and `created_at`.
-- **Banks (ask 21):** `GET /payments/banks` returns `[{"code", "name"}]` A–Z from Paystack, cached for 24 hours.
+- **Banks (asks 21, 45):** `GET /payments/banks` returns `[{"code", "name", "slug"}]` A–Z from Paystack, cached for 24 hours. Each bank code appears once: Paystack listed some banks twice under different names, e.g. "BANKIT MFB" and "BANKIT MICROFINANCE BANK LTD" with the same code, and the fuller name is kept. Banks that can't receive transfers (24 of them) are left out, so an artisan can't pick one we couldn't pay into. That's 258 banks today.
 - **Data export (ask 13):** `GET /auth/me/export` returns one JSON file, served as a download. It covers account, profile, services, portfolio, gigs, bookings, payments, reviews, saved artisans, sent messages, notifications, support requests, verification status and the payout account. Secrets are left out; ID and bank numbers are masked.
 - **Support (ask 14):** `POST /support/tickets {"subject", "message", "booking_id"?}` returns a real `ticket_number` (`SUP-XXXXXX`). `GET /support/tickets` lists the user's own. Admins use `/admin/support-tickets`.
 - **Featured reviews (ask 40):**
@@ -164,7 +173,7 @@ Message `status` goes `sent` → `delivered` (if the recipient was connected liv
   - To collect consent, add a "share publicly" checkbox to the review form.
 - **Gigs (ask 34):** `GET /gigs/?artisan_profile_id=…`.
 - **Upload responses (ask 15):** all upload endpoints declare their response model in OpenAPI.
-- **Favourites (ask 22):** `{pro_id}` is the artisan's **user id**. Their profile id is now accepted too.
+- **Favourites (asks 22, 43):** `{pro_id}` is the artisan's **user id**; their profile id is now accepted too. Each item from `GET /favorites/` now includes `first_name`, `last_name` and `artisan_profile_id`.
 - **Errors (ask 33):**
   - Every unexpected error is a JSON `500 {"detail", "code": "server_error"}`, with CORS headers, never a dropped connection.
   - `"landmark_hint": null` is accepted on buy-gig.
@@ -173,7 +182,7 @@ Message `status` goes `sent` → `delivered` (if the recipient was connected liv
 
 What the backend does today, so we can agree the behaviour:
 
-- `DELETE /auth/me` (an alias of `/auth/deactivate-me`) immediately sets the account inactive, records `deleted_at`, and revokes every session. Login then answers `423 account_deleted`.
+- `DELETE /auth/me` (an alias of `/auth/deactivate-me`) immediately sets the account inactive, records `deleted_at`, and revokes every session. Login then answers `423 account_deleted`. A deleted artisan drops out of search, and their profile page returns 404.
 - **There is no anonymisation job yet.** The response says "data will be anonymised after the retention period", but nothing does that today, and no retention window is defined.
 - There's no restore path. Open bookings and money held in escrow are left as they are. No password or code is asked for, and no email is sent.
 

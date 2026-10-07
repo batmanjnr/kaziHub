@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     # ?booking_id=...; Paystack adds &reference=...&trxref=....
     PAYSTACK_CALLBACK_URL: str = ""
 
+    # Web Push (ask 44). Generate with `python -m scripts.generate_vapid_keys`.
+    # Push stays off (GET /notifications/push/public-key says enabled=false)
+    # until both keys are set.
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_CLAIMS_EMAIL: str = "mailto:support@kazihub.com"
+
     # Optional inbox that receives a copy of each new support ticket.
     SUPPORT_EMAIL: str = ""
 

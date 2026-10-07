@@ -23,6 +23,9 @@ class SavedProfessional(Document):
 
 class FavoriteResponse(BaseModel):
     artisan_id: str
+    artisan_profile_id: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     business_name: Optional[str] = None
     category: Optional[str] = None
     rating_average: Optional[float] = None
